@@ -25,6 +25,7 @@ class MyPlugin(Star):
         
         # 投资模拟相关属性
         self.investment_sessions = {}
+        self.sessions_file = "investment_sessions.json"
         
         # 记录初始化信息
         logger.info(
@@ -36,6 +37,9 @@ class MyPlugin(Star):
 
     async def initialize(self):
         """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
+        self._load_sessions_from_file()
+        self.update_task = asyncio.create_task(self.run_periodic_updates())
+        self.save_task = asyncio.create_task(self._periodic_save_sessions())
 
     def search_coin_sync(self, query: str) -> str | None:
         """使用 CoinGecko 搜索功能查找币种 ID"""
@@ -502,9 +506,6 @@ class MyPlugin(Star):
             logger.error(f"获取涨跌幅榜失败: {e}", exc_info=True)
             yield event.plain_result("❌ 获取涨跌幅榜失败。")
 
-    # 投资模拟相关属性
-    investment_sessions = {}
-    
     @command("cry_fight")
     async def investment_simulation(self, event: AstrMessageEvent, args_str: str = ""):
         """开始或管理投资模拟"""
@@ -522,6 +523,7 @@ class MyPlugin(Star):
                     result = await self.settle_investment(session, event)
                     yield event.plain_result(result)
                     del self.investment_sessions[user_id]
+                    self._save_sessions_to_file()
                 else:
                     yield event.plain_result("❌ 您没有正在进行的投资模拟")             
                     return
@@ -542,21 +544,29 @@ class MyPlugin(Star):
             session = {
                 "initial_funds": initial_funds,
                 "current_funds": initial_funds,
-                "leverage": 0,  # 将由AI决定
-                "cooldown_period": self.cooldown_period,
-                "last_adjustment": 0,
-                "positions": {},
+                "rate_query_cooldown": self.rate_query_cooldown, # 价格更新周期
+                "cooldown_period": self.cooldown_period, # AI调整周期
+                "spot_positions": {},  # 现货持仓
+                "futures_positions": {}, # 合约持仓
+                "margin_used": 0,
+                "cash": initial_funds,  # 初始资金全部为现金
                 "funds_history": [],  # 资金变更记录
-                "start_time": time.time()
+                "start_time": time.time(),
+                "last_ai_update_time": time.time()  # 新增：上次AI更新时间
             }
             
             user_id = event.get_sender_id() if event.get_sender_id() else event.unified_msg_origin
+            session["user_umo"] = event.unified_msg_origin  # 保存umo用于后续发送消息
             self.investment_sessions[user_id] = session
+            self._save_sessions_to_file()
             
             # 使用AI提供商进行初始策略分析
             logger.info("开始获取AI策略分析")
             ai_analysis = await self.get_ai_strategy_analysis(event, session)
             logger.info("AI策略分析获取完成")
+            
+            # 根据AI策略创建初始仓位
+            await self.create_initial_positions(session)
             
             result = f"🎮 投资模拟已开始\n"
             result += f"起始资金: ${initial_funds:,.2f}\n"
@@ -599,35 +609,45 @@ class MyPlugin(Star):
                 return "无法获取AI提供商，请检查配置"
             
             # 构建提示词
+            currency_list_str = ", ".join(self.target_currencies)
             prompt = f"""
-            你是一个专业的加密货币交易员。用户开始了一个投资模拟，初始资金为${session['initial_funds']}。
-            请根据当前市场情况提供初始投资策略，要求以JSON格式返回，包含以下字段：
-            1. leverage: 建议使用的杠杆倍数（根据市场波动性和风险控制需要，数值）
-            2. strategy: 投资策略描述（文本）
-            3. suggested_positions: 建议的仓位配置，包含币种和分配比例的数组
-            4. risk_control: 风险控制建议（文本）
-            5. adjustment_strategy: 仓位调整策略（文本）
-            
-            返回格式示例：
+            你是一个专业的加密货币投资组合经理。用户开始了一个投资模拟，初始资金为${session['initial_funds']}。
+            请根据当前市场情况，提供一个结合**现货持仓(spot)**、**合约持仓(futures)**和**现金(cash)**的综合投资策略。
+
+            **重要规则:**
+            1.  你 **必须** 从以下指定的币种列表中选择投资目标: **{currency_list_str}**。不要使用此列表之外的任何其他币种。
+            2.  你的回答 **必须** 是一个严格的JSON格式，不包含任何解释性文本或代码块标记 (如 ```json)。
+            3.  JSON对象必须包含以下字段: `strategy`, `risk_control`, `adjustment_strategy`, `allocation`。
+            4.  `allocation` 对象必须包含 `spot_positions` (现货仓位数组), `futures_positions` (合约仓位数组), 和 `cash_percentage` (现金占总资金的百分比)。
+            5.  `spot_positions` 数组中的每个对象必须包含 `coin` 和 `percentage`。
+            6.  `futures_positions` 数组中的每个对象必须包含 `coin`, `percentage` (占总资金的比例), `leverage`, 和 `side` ('long' 或 'short')。
+            7.  所有 `percentage` (现货、合约、现金) 的总和 **必须** 等于 100。
+
+            **JSON格式示例:**
             {{
-              "leverage": 10,
-              "strategy": "根据当前市场波动，建议采用中等杠杆策略",
-              "suggested_positions": [
-                {{"coin": "bitcoin", "percentage": 50}},
-                {{"coin": "ethereum", "percentage": 30}}
-              ],
-              "risk_control": "设置止损点为5%",
-              "adjustment_strategy": "当币价波动超过10%时调整仓位"
+              "strategy": "采用核心-卫星策略，比特币和以太坊作为现货核心资产，用小部分资金进行高杠杆合约交易以博取更高收益，并保留部分现金以应对市场波动。",
+              "risk_control": "现货持仓占大部分，合约保证金不超过总资金的10%。总账户止损点为15%。",
+              "adjustment_strategy": "每周审查投资组合。当市场出现重大机会或风险时，动态调整现货和合约的比例。",
+              "allocation": {{
+                "spot_positions": [
+                  {{"coin": "bitcoin", "percentage": 40}},
+                  {{"coin": "ethereum", "percentage": 25}}
+                ],
+                "futures_positions": [
+                  {{"coin": "solana", "percentage": 5, "leverage": 20, "side": "long"}}
+                ],
+                "cash_percentage": 30
+              }}
             }}
             
-            请严格按照上述JSON格式返回，不要包含其他内容，不要使用代码块标记（如```json）。
+            请严格遵守以上所有规则，并立即返回JSON。
             """
             
             logger.info("开始调用AI提供商的text_chat方法")
             # 请求AI分析
             llm_response = await provider.text_chat(
                 prompt=prompt,
-                system_prompt="你是一个专业的加密货币交易员和投资顾问，必须严格按照要求的JSON格式返回数据，不要使用代码块标记（如```json）"
+                system_prompt="你是一个专业的加密货币合约交易员和投资顾问，必须严格按照要求的JSON格式返回数据，不要使用代码块标记（如```json）"
             )
             logger.info("AI提供商调用完成")
             
@@ -651,21 +671,30 @@ class MyPlugin(Star):
                     completion_text = '\n'.join(json_lines)
                 
                 ai_data = json.loads(completion_text)
-                # 更新会话中的杠杆倍数
-                if "leverage" in ai_data:
-                    session["leverage"] = ai_data["leverage"]
                 
                 # 构造返回文本
-                result = f"建议杠杆: {ai_data.get('leverage', 'N/A')}x\n"
-                result += f"投资策略: {ai_data.get('strategy', 'N/A')}\n"
-                result += "建议仓位: \n"
-                for pos in ai_data.get('suggested_positions', []):
-                    result += f"  - {pos.get('coin', 'N/A')}: {pos.get('percentage', 0)}%\n"
+                allocation = ai_data.get('allocation', {})
+                spot_positions = allocation.get('spot_positions', [])
+                futures_positions = allocation.get('futures_positions', [])
+                cash_percentage = allocation.get('cash_percentage', 0)
+
+                result = f"投资策略: {ai_data.get('strategy', 'N/A')}\n"
+                result += "建议仓位配置: \n"
+                if spot_positions:
+                    result += "  - **现货持仓**:\n"
+                    for pos in spot_positions:
+                        result += f"    • {pos.get('coin', 'N/A')}: {pos.get('percentage', 0)}%\n"
+                if futures_positions:
+                    result += "  - **合约持仓**:\n"
+                    for pos in futures_positions:
+                        side_str = "做多" if pos.get('side') == 'long' else "做空"
+                        result += f"    • {pos.get('coin', 'N/A')}: {pos.get('percentage', 0)}% ({side_str} @ {pos.get('leverage', 1)}x)\n"
+                result += f"  - **现金**: {cash_percentage}%\n"
                 result += f"风险控制: {ai_data.get('risk_control', 'N/A')}\n"
                 result += f"调整策略: {ai_data.get('adjustment_strategy', 'N/A')}\n"
                 
                 # 保存建议仓位到会话
-                session["suggested_positions"] = ai_data.get('suggested_positions', [])
+                session["suggested_allocation"] = allocation
                 
                 return result
             except json.JSONDecodeError as e:
@@ -722,7 +751,7 @@ class MyPlugin(Star):
             
             # 构建提示词
             prompt = f"""
-            你是一个专业的投资分析师。用户完成了一个投资模拟，初始资金为${session['initial_funds']}，
+            你是一个专业的投资分析师。用户完成了一个合约投资模拟，初始资金为${session['initial_funds']}，
             最终资金为${session['current_funds']}，盈亏为${profit_loss}。
             请分析这次投资的表现，包括成功或失败的原因，以及未来改进建议。
             如果有资金变更记录，请结合这些记录进行分析。
@@ -794,45 +823,225 @@ class MyPlugin(Star):
             logger.error(f"获取AI性能分析失败: {e}")
             return "无法获取AI性能分析"
     
-    @command("cry_fight_adjust")
-    async def adjust_investment_funds(self, event: AstrMessageEvent, args_str: str = ""):
-        """调整投资模拟资金"""
+    async def create_initial_positions(self, session):
+        """根据AI建议创建初始混合仓位（现货 + 合约）"""
+        allocation = session.get("suggested_allocation", {})
+        if not allocation:
+            logger.warning("AI未提供建议仓位，将全部保留为现金")
+            session["cash"] = session["initial_funds"]
+            session["spot_positions"] = {}
+            session["futures_positions"] = {}
+            return
+
+        spot_positions = allocation.get('spot_positions', [])
+        futures_positions = allocation.get('futures_positions', [])
+        cash_percentage = allocation.get('cash_percentage', 0)
+
+        # 验证并规范化百分比总和
+        total_percentage = sum(p.get('percentage', 0) for p in spot_positions) + \
+                           sum(p.get('percentage', 0) for p in futures_positions) + \
+                           cash_percentage
+
+        if not (99.9 < total_percentage < 100.1) and total_percentage > 0:
+            logger.warning(f"AI建议的总分配比例不为100% (实际: {total_percentage}%)，将按比例调整。")
+            scale_factor = 100.0 / total_percentage
+            
+            for pos in spot_positions:
+                pos['percentage'] *= scale_factor
+            for pos in futures_positions:
+                pos['percentage'] *= scale_factor
+            cash_percentage *= scale_factor
+            
+            # 更新分配对象以反映调整
+            allocation['spot_positions'] = spot_positions
+            allocation['futures_positions'] = futures_positions
+            allocation['cash_percentage'] = cash_percentage
+        
+        all_coin_ids = [p['coin'] for p in spot_positions] + [p['coin'] for p in futures_positions]
+        if not all_coin_ids:
+            logger.info("AI建议全仓持有现金。")
+            session["cash"] = session["initial_funds"]
+            return
+            
         try:
-            user_id = event.get_sender_id() if event.get_sender_id() else event.unified_msg_origin
-            if user_id not in self.investment_sessions:
-                yield event.plain_result("❌ 您没有正在进行的投资模拟")
+            prices_data = await asyncio.to_thread(self.cg.get_price, ids=list(set(all_coin_ids)), vs_currencies='usd')
+            if not prices_data:
+                logger.error("无法获取初始仓位价格，模拟启动失败")
+                session["cash"] = session["initial_funds"]
                 return
+
+            initial_funds = session['initial_funds']
+            cash_used = 0
+            margin_used = 0
+
+            # 创建现货仓位
+            for pos_info in spot_positions:
+                coin_id = pos_info['coin']
+                percentage = pos_info['percentage']
+                price = prices_data.get(coin_id, {}).get('usd')
+
+                if price is None or price == 0:
+                    logger.warning(f"无法获取现货 {coin_id} 的价格，该仓位将跳过")
+                    continue
+                
+                investment_amount = initial_funds * (percentage / 100)
+                coin_amount = investment_amount / price
+                cash_used += investment_amount
+
+                session['spot_positions'][coin_id] = {
+                    'amount': coin_amount,
+                    'entry_price': price,
+                    'current_price': price,
+                    'value': investment_amount,
+                    'pnl': 0
+                }
             
-            session = self.investment_sessions[user_id]
-            
-            try:
-                amount = float(args_str.strip())
-            except ValueError:
-                yield event.plain_result("❌ 请输入有效的资金数量，正数表示增加资金，负数表示减少资金")
-                return
-            
-            old_funds = session["current_funds"]
-            session["current_funds"] += amount
-            
-            # 记录资金变更
-            session["funds_history"].append({
-                "time": time.time(),
-                "old_funds": old_funds,
-                "amount": amount,
-                "new_funds": session["current_funds"]
-            })
-            
-            change_type = "增加" if amount > 0 else "减少"
-            result = f"📊 投资资金调整\n"
-            result += f"调整类型: {change_type}\n"
-            result += f"调整金额: ${abs(amount):,.2f}\n"
-            result += f"调整前资金: ${old_funds:,.2f}\n"
-            result += f"调整后资金: ${session['current_funds']:,.2f}"
-            
-            yield event.plain_result(result)
+            # 创建合约仓位
+            for pos_info in futures_positions:
+                coin_id = pos_info['coin']
+                percentage = pos_info.get('percentage', 0)
+                leverage = pos_info.get('leverage', 1)
+                side = pos_info.get('side', 'long')
+                price = prices_data.get(coin_id, {}).get('usd')
+
+                if price is None or price == 0:
+                    logger.warning(f"无法获取合约 {coin_id} 的价格，该仓位将跳过")
+                    continue
+
+                position_value = initial_funds * (percentage / 100)
+                margin = position_value / leverage
+                coin_amount = position_value / price
+                margin_used += margin
+
+                if side == 'long':
+                    liquidation_price = price * (1 - (1 / leverage))
+                else: # short
+                    liquidation_price = price * (1 + (1 / leverage))
+
+                session['futures_positions'][coin_id] = {
+                    'amount': coin_amount,
+                    'entry_price': price,
+                    'current_price': price,
+                    'value': position_value,
+                    'margin': margin,
+                    'leverage': leverage,
+                    'side': side,
+                    'liquidation_price': liquidation_price,
+                    'pnl': 0
+                }
+
+            session["cash"] = initial_funds - cash_used - margin_used
+            session["margin_used"] = margin_used
+            session["current_funds"] = initial_funds
+            logger.info(f"初始混合仓位创建完成. 现货投入: ${cash_used:.2f}, 合约保证金: ${margin_used:.2f}, 剩余现金: ${session['cash']:.2f}")
+
         except Exception as e:
-            logger.error(f"调整投资资金失败: {e}")
-            yield event.plain_result("❌ 调整投资资金失败")
+            logger.error(f"创建初始仓位失败: {e}", exc_info=True)
+            session["cash"] = session["initial_funds"]
+            session["spot_positions"] = {}
+            session["futures_positions"] = {}
+
+    async def run_periodic_updates(self):
+        """定期更新所有投资模拟会话"""
+        while True:
+            try:
+                # 使用查询汇率的冷却时间作为价格更新间隔
+                await asyncio.sleep(self.rate_query_cooldown)
+                # 仅在有活跃的投资会话时才进行更新
+                if self.investment_sessions:
+                    await self.update_all_sessions()
+            except asyncio.CancelledError:
+                logger.info("投资模拟更新任务已取消")
+                break
+            except Exception as e:
+                logger.error(f"定期更新投资模拟失败: {e}", exc_info=True)
+                # 避免因单次错误而中断整个循环
+                await asyncio.sleep(60)
+
+    async def update_all_sessions(self):
+        """更新所有活跃的投资会话"""
+        user_ids = list(self.investment_sessions.keys())
+        if not user_ids:
+            return
+
+        for user_id in user_ids:
+            session = self.investment_sessions.get(user_id)
+            if not session:
+                continue
+            
+            spot_positions = session.get("spot_positions", {})
+            futures_positions = session.get("futures_positions", {})
+            
+            if not spot_positions and not futures_positions:
+                continue
+
+            try:
+                all_coin_ids = list(spot_positions.keys()) + list(futures_positions.keys())
+                if not all_coin_ids:
+                    continue
+
+                prices_data = await asyncio.to_thread(self.cg.get_price, ids=list(set(all_coin_ids)), vs_currencies='usd')
+                if not prices_data:
+                    logger.warning(f"无法获取用户 {user_id} 投资组合的价格")
+                    continue
+
+                total_spot_value = 0
+                
+                # 更新现货仓位
+                for coin_id, pos_data in spot_positions.items():
+                    current_price = prices_data.get(coin_id, {}).get('usd', pos_data['current_price'])
+                    pos_data['current_price'] = current_price
+                    pos_data['value'] = pos_data['amount'] * current_price
+                    pnl = pos_data['value'] - (pos_data['amount'] * pos_data['entry_price'])
+                    pos_data['pnl'] = pnl
+                    total_spot_value += pos_data['value']
+
+                total_futures_pnl = 0
+                liquidated_coins = []
+
+                # 更新合约仓位
+                for coin_id, pos_data in futures_positions.items():
+                    current_price = prices_data.get(coin_id, {}).get('usd', pos_data['current_price'])
+                    pos_data['current_price'] = current_price
+                    
+                    # 检查强平
+                    if (pos_data['side'] == 'long' and current_price <= pos_data['liquidation_price']) or \
+                       (pos_data['side'] == 'short' and current_price >= pos_data['liquidation_price']):
+                        logger.warning(f"用户 {user_id} 的 {coin_id} {pos_data['side']} 仓位已被强平！")
+                        session['margin_used'] -= pos_data['margin']
+                        liquidated_coins.append(coin_id)
+                        continue
+
+                    # 计算 PnL
+                    price_diff = current_price - pos_data['entry_price']
+                    if pos_data['side'] == 'short':
+                        price_diff = -price_diff
+                    
+                    pnl = price_diff * pos_data['amount']
+                    pos_data['pnl'] = pnl
+                    total_futures_pnl += pnl
+
+                # 移除被强平的仓位
+                for coin_id in liquidated_coins:
+                    del session['futures_positions'][coin_id]
+
+                # 计算总资产
+                cash = session.get("cash", 0)
+                margin_used = session.get("margin_used", 0)
+                
+                # 总资产 = 剩余现金 + 现货总价值 + 已用保证金 + 合约总盈亏
+                session["current_funds"] = cash + total_spot_value + margin_used + total_futures_pnl
+                # logger.info(f"用户 {user_id} 的投资组合已更新，当前总资金: {session['current_funds']:.2f}")
+
+                # 检查是否需要AI进行调仓
+                if time.time() - session.get("last_ai_update_time", 0) > session.get("cooldown_period", 300):
+                    logger.info(f"用户 {user_id} 的投资模拟触发AI调仓...")
+                    # 创建一个独立的任务来处理AI调仓，避免阻塞主更新循环
+                    asyncio.create_task(self.trigger_ai_rebalance(user_id, session))
+                    session["last_ai_update_time"] = time.time()
+
+            except Exception as e:
+                logger.error(f"更新用户 {user_id} 的投资模拟会话失败: {e}", exc_info=True)
     
     @command("cry_fight_status")
     async def investment_status(self, event: AstrMessageEvent):
@@ -845,33 +1054,259 @@ class MyPlugin(Star):
             
             session = self.investment_sessions[user_id]
             
-            # 计算盈亏
-            profit_loss = session["current_funds"] - session["initial_funds"]
+            # 重新计算当前总资金以确保数据一致性
+            spot_positions = session.get("spot_positions", {})
+            futures_positions = session.get("futures_positions", {})
+            
+            total_spot_value = sum(p.get('value', 0) for p in spot_positions.values())
+            total_futures_pnl = sum(p.get('pnl', 0) for p in futures_positions.values())
+            cash = session.get("cash", 0)
+            margin_used = session.get("margin_used", 0)
+            current_funds = cash + total_spot_value + margin_used + total_futures_pnl
+            session["current_funds"] = current_funds
+
+            # 计算总盈亏
+            profit_loss = current_funds - session["initial_funds"]
             profit_loss_percent = (profit_loss / session["initial_funds"]) * 100 if session["initial_funds"] != 0 else 0
             
             result = f"📊 投资模拟状态\n"
             result += f"起始资金: ${session['initial_funds']:,.2f}\n"
-            result += f"当前资金: ${session['current_funds']:,.2f}\n"
-            result += f"盈亏: ${profit_loss:,.2f} ({profit_loss_percent:+.2f}%)\n"
-            result += f"当前杠杆: {session.get('leverage', 'N/A')}x\n"
-            
-            # 显示资金变更历史
-            if session["funds_history"]:
-                result += "\n资金变更历史:\n"
-                for i, record in enumerate(session["funds_history"][-5:], 1):  # 只显示最近5条记录
-                    change_type = "增加" if record['amount'] > 0 else "减少"
-                    result += f"{i}. {change_type} ${abs(record['amount']):,.2f} (余额: ${record['new_funds']:,.2f})\n"
-            
-            # 显示建议仓位
-            if session.get("suggested_positions"):
-                result += "\n建议仓位:\n"
-                for pos in session["suggested_positions"]:
-                    result += f"  - {pos.get('coin', 'N/A')}: {pos.get('percentage', 0)}%\n"
+            result += f"当前总资产: ${current_funds:,.2f}\n"
+            result += f"总盈亏: ${profit_loss:,.2f} ({profit_loss_percent:+.2f}%)\n"
+            result += f"可用现金: ${cash:,.2f}\n"
+            result += "--------------------\n"
+
+            # 显示现货持仓
+            if spot_positions:
+                result += "📦 **现货持仓**:\n"
+                for coin_id, pos in spot_positions.items():
+                    pnl = pos.get('pnl', 0)
+                    entry_value = pos['amount'] * pos['entry_price']
+                    pnl_percent = (pnl / entry_value) * 100 if entry_value > 0 else 0
+                    result += f"  - {coin_id.capitalize()}:\n"
+                    result += f"    持仓价值: ${pos['value']:,.2f}\n"
+                    result += f"    未实现盈亏: ${pnl:,.2f} ({pnl_percent:+.2f}%)\n"
+            else:
+                result += "📦 **现货持仓**: 无\n"
+
+            result += "--------------------\n"
+
+            # 显示合约持仓
+            if futures_positions:
+                result += f"📈 **合约持仓** (保证金: ${margin_used:,.2f}):\n"
+                for coin_id, pos in futures_positions.items():
+                    side_str = "多头" if pos['side'] == 'long' else "空头"
+                    pnl = pos.get('pnl', 0)
+                    pnl_percent = (pnl / pos['margin']) * 100 if pos['margin'] > 0 else 0
+                    result += f"  - {coin_id.capitalize()} ({side_str} {pos['leverage']}x):\n"
+                    result += f"    开仓价: ${pos['entry_price']:,.4f}, 当前价: ${pos.get('current_price', 0):,.4f}\n"
+                    result += f"    强平价: ${pos['liquidation_price']:,.4f}\n"
+                    result += f"    未实现盈亏: ${pnl:,.2f} ({pnl_percent:+.2f}%)\n"
+            else:
+                result += "📈 **合约持仓**: 无\n"
             
             yield event.plain_result(result)
         except Exception as e:
             logger.error(f"查看投资状态失败: {e}", exc_info=True)
             yield event.plain_result("❌ 查看投资状态失败")
     
+    async def get_ai_rebalance_plan(self, user_id: str, session: dict) -> dict | None:
+        """获取AI对当前投资组合的调仓计划"""
+        try:
+            provider = self.context.get_using_provider(umo=session.get("user_umo"))
+            if not provider:
+                logger.error(f"无法为用户 {user_id} 获取AI提供商进行调仓")
+                return None
+
+            # 准备提供给AI的当前持仓状态
+            portfolio_summary = {
+                "current_total_funds": session.get("current_funds", 0),
+                "available_cash": session.get("cash", 0),
+                "spot_positions": [
+                    {
+                        "coin": coin, "amount": pos.get('amount', 0), "entry_price": pos.get('entry_price', 0),
+                        "current_price": pos.get('current_price', 0), "pnl": pos.get('pnl', 0)
+                    } for coin, pos in session.get("spot_positions", {}).items()
+                ],
+                "futures_positions": [
+                    {
+                        "coin": coin, "side": pos.get('side'), "leverage": pos.get('leverage'),
+                        "entry_price": pos.get('entry_price', 0), "current_price": pos.get('current_price', 0),
+                        "pnl": pos.get('pnl', 0), "liquidation_price": pos.get('liquidation_price', 0)
+                    } for coin, pos in session.get("futures_positions", {}).items()
+                ]
+            }
+            
+            currency_list_str = ", ".join(self.target_currencies)
+            prompt = f"""
+            你是一个顶级的加密货币基金经理，负责管理一个动态的投资组合。
+            **你的当前投资组合状态:**
+            ```json
+            {json.dumps(portfolio_summary, indent=2, ensure_ascii=False)}
+            ```
+            **你的任务:** 根据当前的市场状况和你的投资组合表现，决定是否需要进行调仓。你的目标是最大化收益，同时控制风险。
+            **可用操作:** 你必须返回一个包含 `analysis` (你的决策分析) 和 `actions` (一个操作指令列表) 的JSON对象。
+            `actions` 列表可以包含以下一种或多种操作:
+            1. `{{ "action": "SELL_SPOT", "coin": "<coin_id>", "percentage_of_holding": <0-100> }}`: 卖出指定现货持仓的一部分或全部。
+            2. `{{ "action": "CLOSE_FUTURES", "coin": "<coin_id>" }}`: 平掉指定的整个合约仓位。
+            3. `{{ "action": "BUY_SPOT", "coin": "<coin_id>", "percentage_of_cash": <0-100> }}`: 使用一部分可用现金购买现货。
+            4. `{{ "action": "OPEN_FUTURES", "coin": "<coin_id>", "percentage_of_cash": <1-50>, "leverage": <1-50>, "side": "<long|short>" }}`: 使用一部分可用现金作为保证金，开立新的合约仓位。
+            5. `{{ "action": "HOLD", "reason": "<为什么选择不动>" }}`: 如果你认为当前仓位是最佳的，选择不进行任何操作。
+            **重要规则:**
+            - 所有操作的 `coin` **必须** 从这个列表中选择: `{currency_list_str}`.
+            - `percentage_of_cash` 的总和不应超过100。
+            - 你的回答 **必须** 是一个严格的JSON格式，不包含任何解释性文本或代码块标记。
+            请立即根据当前情况返回你的决策JSON。
+            """
+
+            llm_response = await provider.text_chat(prompt=prompt, system_prompt="你是一个专业的加密货币基金经理，必须严格按照要求的JSON格式返回决策，不要使用代码块标记。")
+            
+            completion_text = llm_response.completion_text.strip().replace("```json", "").replace("```", "")
+            plan = json.loads(completion_text)
+            logger.info(f"为用户 {user_id} 获取到AI调仓计划: {plan}")
+            return plan
+
+        except Exception as e:
+            logger.error(f"获取AI调仓计划失败: {e}", exc_info=True)
+            return None
+
+    async def trigger_ai_rebalance(self, user_id: str, session: dict):
+        """触发AI进行调仓决策并执行"""
+        logger.info(f"开始为用户 {user_id} 进行AI调仓...")
+        plan = await self.get_ai_rebalance_plan(user_id, session)
+
+        if not plan or not plan.get("actions"):
+            logger.warning(f"未能获取到用户 {user_id} 的有效AI调仓计划。")
+            return
+            
+        execution_summary = await self.execute_rebalance_plan(user_id, session, plan)
+
+        analysis = plan.get("analysis", "无分析。")
+        if execution_summary:
+            message = f"🤖 **AI 投资组合调整已执行**\n\n**分析:** {analysis}\n\n**执行操作:**\n" + "\n".join(execution_summary)
+            umo = session.get("user_umo")
+            if umo:
+                await self.context.send_message(message, umo=umo)
+            else:
+                logger.warning(f"无法发送AI调仓通知，因为在会话中找不到 user_umo for user {user_id}")
+
+    async def execute_rebalance_plan(self, user_id: str, session: dict, plan: dict) -> list[str]:
+        """执行AI返回的调仓计划"""
+        actions = plan.get("actions", [])
+        if not actions or actions[0].get("action") == "HOLD":
+            return ["• AI建议保持仓位不变，未执行任何操作。"]
+
+        execution_summary = []
+        coin_ids_to_fetch = {act['coin'] for act in actions if 'coin' in act}
+        prices_data = {}
+        if coin_ids_to_fetch:
+            try:
+                prices_data = await asyncio.to_thread(self.cg.get_price, ids=list(coin_ids_to_fetch), vs_currencies='usd')
+            except Exception as e:
+                logger.error(f"执行调仓前获取价格失败: {e}")
+                return ["• 获取最新价格失败，无法执行调仓。"]
+
+        # 1. 首先执行所有卖出/平仓操作
+        sell_actions = [act for act in actions if act.get("action") in ("SELL_SPOT", "CLOSE_FUTURES")]
+        buy_actions = [act for act in actions if act.get("action") in ("BUY_SPOT", "OPEN_FUTURES")]
+
+        for act in sell_actions:
+            coin_id = act.get("coin")
+            if act.get("action") == "SELL_SPOT" and coin_id in session['spot_positions']:
+                pos = session['spot_positions'][coin_id]
+                percentage_to_sell = act.get('percentage_of_holding', 0)
+                amount_to_sell = pos['amount'] * (percentage_to_sell / 100)
+                current_price = prices_data.get(coin_id, {}).get('usd', pos['current_price'])
+                cash_gained = amount_to_sell * current_price
+                session['cash'] += cash_gained
+                pos['amount'] -= amount_to_sell
+                execution_summary.append(f"• 卖出 {amount_to_sell:.6f} {coin_id.upper()} (价值 ${cash_gained:,.2f})")
+                if pos['amount'] < 1e-9: del session['spot_positions'][coin_id]
+
+            elif act.get("action") == "CLOSE_FUTURES" and coin_id in session['futures_positions']:
+                pos = session['futures_positions'][coin_id]
+                current_price = prices_data.get(coin_id, {}).get('usd', pos['current_price'])
+                price_diff = current_price - pos['entry_price']
+                if pos['side'] == 'short': price_diff = -price_diff
+                pnl = price_diff * pos['amount']
+                cash_returned = pos['margin'] + pnl
+                session['cash'] += cash_returned
+                session['margin_used'] -= pos['margin']
+                del session['futures_positions'][coin_id]
+                execution_summary.append(f"• 平仓 {coin_id.upper()} 合约，返还现金 ${cash_returned:,.2f} (含盈亏 ${pnl:,.2f})")
+
+        # 2. 然后执行所有买入/开仓操作
+        cash_for_investment = session['cash']
+        for act in buy_actions:
+            coin_id = act.get("coin")
+            price = prices_data.get(coin_id, {}).get('usd')
+            if not price: continue
+
+            if act.get("action") == "BUY_SPOT":
+                amount_to_invest = cash_for_investment * (act.get('percentage_of_cash', 0) / 100)
+                if session['cash'] >= amount_to_invest > 0:
+                    coin_amount_to_buy = amount_to_invest / price
+                    session['cash'] -= amount_to_invest
+                    if coin_id in session['spot_positions']:
+                        pos = session['spot_positions'][coin_id]
+                        new_total_cost = (pos['amount'] * pos['entry_price']) + amount_to_invest
+                        pos['amount'] += coin_amount_to_buy
+                        pos['entry_price'] = new_total_cost / pos['amount']
+                    else:
+                        session['spot_positions'][coin_id] = {'amount': coin_amount_to_buy, 'entry_price': price, 'current_price': price, 'value': amount_to_invest, 'pnl': 0}
+                    execution_summary.append(f"• 使用 ${amount_to_invest:,.2f} 买入 {coin_id.upper()} 现货")
+
+            elif act.get("action") == "OPEN_FUTURES":
+                if coin_id in session['futures_positions']:
+                    execution_summary.append(f"• 跳过开仓 {coin_id.upper()}: 已存在该币种的合约。")
+                    continue
+                margin_to_use = cash_for_investment * (act.get('percentage_of_cash', 0) / 100)
+                leverage = act.get('leverage', 1)
+                side = act.get('side', 'long')
+                if session['cash'] >= margin_to_use > 0:
+                    session['cash'] -= margin_to_use
+                    session['margin_used'] += margin_to_use
+                    position_value = margin_to_use * leverage
+                    coin_amount = position_value / price
+                    liquidation_price = price * (1 - (1 / leverage)) if side == 'long' else price * (1 + (1 / leverage))
+                    session['futures_positions'][coin_id] = {'amount': coin_amount, 'entry_price': price, 'current_price': price, 'value': position_value, 'margin': margin_to_use, 'leverage': leverage, 'side': side, 'liquidation_price': liquidation_price, 'pnl': 0}
+                    side_str = "多单" if side == 'long' else "空单"
+                    execution_summary.append(f"• 使用 ${margin_to_use:,.2f} 保证金开立 {coin_id.upper()} {leverage}x {side_str}")
+        return execution_summary
+
     async def terminate(self):
         """可选择实现异步的插件销毁方法，当插件被卸载/停用时会调用。"""
+    def _save_sessions_to_file(self):
+        """将所有投资会话保存到JSON文件"""
+        try:
+            with open(self.sessions_file, 'w', encoding='utf-8') as f:
+                json.dump(self.investment_sessions, f, ensure_ascii=False, indent=4)
+            logger.info(f"投资会话已成功保存到 {self.sessions_file}")
+        except Exception as e:
+            logger.error(f"保存投资会话失败: {e}", exc_info=True)
+
+    def _load_sessions_from_file(self):
+        """从JSON文件加载投资会话"""
+        try:
+            with open(self.sessions_file, 'r', encoding='utf-8') as f:
+                self.investment_sessions = json.load(f)
+            logger.info(f"投资会话已从 {self.sessions_file} 加载")
+        except FileNotFoundError:
+            logger.info("未找到投资会话文件，将创建一个新的会话记录")
+            self.investment_sessions = {}
+        except Exception as e:
+            logger.error(f"加载投资会话失败: {e}", exc_info=True)
+            self.investment_sessions = {}
+            
+    async def _periodic_save_sessions(self):
+        """定期保存会话状态"""
+        while True:
+            await asyncio.sleep(300)  # 每5分钟保存一次
+            if self.investment_sessions:
+                logger.info("开始定期保存投资会话...")
+                self._save_sessions_to_file()
+        self._save_sessions_to_file()
+        if hasattr(self, 'update_task') and self.update_task:
+            self.update_task.cancel()
+        if hasattr(self, 'save_task') and self.save_task:
+            self.save_task.cancel()
