@@ -524,8 +524,10 @@ class MyPlugin(Star):
                     yield event.plain_result(result)
                     del self.investment_sessions[user_id]
                     self._save_sessions_to_file()
+                    logger.info(f"用户 {user_id} 的投资会话已成功结算并删除。")
+                    return  # 确保在此处结束函数执行
                 else:
-                    yield event.plain_result("❌ 您没有正在进行的投资模拟")             
+                    yield event.plain_result("❌ 您没有正在进行的投资模拟")
                     return
             
             # 开始新的投资模拟
