@@ -4,19 +4,40 @@ from astrbot.api import logger
 import asyncio
 import astrbot.api.message_components as Comp
 from astrbot.api.all import command
+import json
+import time
 
 from pycoingecko import CoinGeckoAPI
 
 @register("cryptocurrency", "vmoranv", "加密货币价格查询插件", "1.0.0")
 class MyPlugin(Star):
-    def __init__(self, context: Context):
+    def __init__(self, context: Context, config: dict | None = None):
+        """初始化加密货币插件"""
         super().__init__(context)
+        self.config = config if config is not None else {}
         self.cg = CoinGeckoAPI()
+        
+        # 设置默认配置
+        self.target_currencies = self.config.get("target_currencies", ["bitcoin", "ethereum"])
+        self.cooldown_period = self.config.get("cooldown_period", 300)
+        self.provider_list = self.config.get("provider_list", [])
+        self.rate_query_cooldown = self.config.get("rate_query_cooldown", 2)
+        
+        # 投资模拟相关属性
+        self.investment_sessions = {}
+        
+        # 记录初始化信息
+        logger.info(
+            f"加密货币插件配置加载: target_currencies={self.target_currencies}, "
+            f"cooldown_period={self.cooldown_period} 秒, "
+            f"provider_list={self.provider_list}, "
+            f"rate_query_cooldown={self.rate_query_cooldown}秒"
+        )
 
     async def initialize(self):
         """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
 
-    def search_coin_sync(self, query: str) -> str:
+    def search_coin_sync(self, query: str) -> str | None:
         """使用 CoinGecko 搜索功能查找币种 ID"""
         try:
             results = self.cg.search(query=query)
@@ -27,31 +48,31 @@ class MyPlugin(Star):
             logger.error(f"搜索币种失败: {e}", exc_info=True)
             return None
     
-    def get_coin_details_sync(self, coin_id: str) -> dict:
+    def get_coin_details_sync(self, coin_id: str) -> dict | None:
         """同步方法：查询加密货币的详细信息"""
         try:
             coin_data = self.cg.get_coin_by_id(id=coin_id, localization='false', tickers='false', market_data='true', community_data='false', developer_data='false', sparkline='false')
             return coin_data
         except Exception as e:
             logger.error(f"查询币种详情失败: {e}", exc_info=True)
-            raise
+            return None
 
-    def get_market_chart_sync(self, coin_id: str, days: int) -> dict:
+    def get_market_chart_sync(self, coin_id: str, days: int) -> dict | None:
         """同步方法：查询历史市场数据"""
         try:
             return self.cg.get_coin_market_chart_by_id(id=coin_id, vs_currency='usd', days=days)
         except Exception as e:
             logger.error(f"查询历史数据失败: {e}", exc_info=True)
-            raise
+            return None
 
-    def get_tickers_sync(self, coin_id: str) -> dict:
+    def get_tickers_sync(self, coin_id: str) -> dict | None:
         """同步方法：使用 get_coin_by_id 获取币种的交易对信息"""
         try:
             # pycoingecko库通过这种方式获取tickers
             return self.cg.get_coin_by_id(id=coin_id, localization='false', tickers='true', market_data='false', community_data='false', developer_data='false', sparkline='false')
         except Exception as e:
             logger.error(f"查询交易对失败: {e}", exc_info=True)
-            raise
+            return None
 
     @command("crypto")
     async def query_crypto_price(self, event: AstrMessageEvent, symbol: str = ""):
@@ -150,6 +171,23 @@ class MyPlugin(Star):
             logger.error(f"获取热门币种失败: {e}", exc_info=True)
             yield event.plain_result("❌ 获取热门币种失败")
 
+    @command("config_currencies")
+    async def config_currencies(self, event: AstrMessageEvent):
+        """显示当前配置的目标加密货币"""
+        try:
+            if not self.target_currencies:
+                yield event.plain_result("❌ 未配置目标加密货币")
+                return
+            
+            result_lines = ["📋 当前配置的目标加密货币:"]
+            for currency in self.target_currencies:
+                result_lines.append(f"• {currency}")
+            
+            yield event.plain_result("\n".join(result_lines))
+        except Exception as e:
+            logger.error(f"获取配置货币失败: {e}")
+            yield event.plain_result("❌ 获取配置货币失败")
+    
     @command("global")
     async def global_market_data(self, event: AstrMessageEvent):
         """获取全球加密货币市场数据"""
@@ -464,5 +502,376 @@ class MyPlugin(Star):
             logger.error(f"获取涨跌幅榜失败: {e}", exc_info=True)
             yield event.plain_result("❌ 获取涨跌幅榜失败。")
 
+    # 投资模拟相关属性
+    investment_sessions = {}
+    
+    @command("cry_fight")
+    async def investment_simulation(self, event: AstrMessageEvent, args_str: str = ""):
+        """开始或管理投资模拟"""
+        try:
+            logger.info(f"投资模拟命令被调用，参数: {args_str}")
+            args = args_str.strip().split()
+            
+            if not args or args[0].lower() == "finish":
+                logger.info("用户请求结束投资模拟")
+                # 结算盈亏
+                user_id = event.get_sender_id() if event.get_sender_id() else event.unified_msg_origin
+                logger.info(f"用户标识: {user_id}")
+                if user_id in self.investment_sessions:
+                    session = self.investment_sessions[user_id]
+                    result = await self.settle_investment(session, event)
+                    yield event.plain_result(result)
+                    del self.investment_sessions[user_id]
+                else:
+                    yield event.plain_result("❌ 您没有正在进行的投资模拟")             
+                    return
+            
+            # 开始新的投资模拟
+            logger.info("用户请求开始新的投资模拟")
+            try:
+                initial_funds = float(args[0])
+                logger.info(f"起始资金: {initial_funds}")
+                if initial_funds <= 0:
+                    yield event.plain_result("❌ 起始资金必须大于0")
+                    return
+            except ValueError:
+                yield event.plain_result("❌ 请输入有效的起始资金数量")
+                return
+            
+            # 创建新的投资会话
+            session = {
+                "initial_funds": initial_funds,
+                "current_funds": initial_funds,
+                "leverage": 0,  # 将由AI决定
+                "cooldown_period": self.cooldown_period,
+                "last_adjustment": 0,
+                "positions": {},
+                "funds_history": [],  # 资金变更记录
+                "start_time": time.time()
+            }
+            
+            user_id = event.get_sender_id() if event.get_sender_id() else event.unified_msg_origin
+            self.investment_sessions[user_id] = session
+            
+            # 使用AI提供商进行初始策略分析
+            logger.info("开始获取AI策略分析")
+            ai_analysis = await self.get_ai_strategy_analysis(event, session)
+            logger.info("AI策略分析获取完成")
+            
+            result = f"🎮 投资模拟已开始\n"
+            result += f"起始资金: ${initial_funds:,.2f}\n"
+            result += f"当前资金: ${session['current_funds']:,.2f}\n"
+            result += f"\n🤖 AI 初始策略建议:\n{ai_analysis}"
+            
+            yield event.plain_result(result)
+        except Exception as e:
+            logger.error(f"投资模拟失败: {e}", exc_info=True)
+            yield event.plain_result("❌ 投资模拟启动失败")
+    
+    async def get_ai_strategy_analysis(self, event: AstrMessageEvent, session) -> str:
+        """获取AI对投资策略的分析"""
+        try:
+            logger.info("开始获取AI提供商")
+            # 获取AI提供商
+            provider = None
+            # 如果配置了提供商列表，则按顺序尝试
+            if self.provider_list:
+                logger.info(f"尝试使用配置的提供商列表: {self.provider_list}")
+                for provider_id in self.provider_list:
+                    provider = self.context.get_provider_by_id(provider_id=provider_id)
+                    if provider:
+                        logger.info(f"成功获取到提供商: {provider_id}")
+                        break
+            # 如果没有配置提供商列表或列表中的提供商都不可用，则使用当前平台的提供商
+            if not provider:
+                logger.info("尝试使用当前平台的提供商")
+                provider = self.context.get_using_provider(umo=event.unified_msg_origin)
+            # 如果仍然没有获取到提供商，则使用第一个可用的提供商
+            if not provider:
+                logger.info("尝试使用第一个可用的提供商")
+                providers = self.context.get_all_providers()
+                if providers:
+                    provider = providers[0]
+                    logger.info(f"使用第一个可用的提供商: {provider}")
+            
+            if not provider:
+                logger.error("无法获取任何AI提供商")
+                return "无法获取AI提供商，请检查配置"
+            
+            # 构建提示词
+            prompt = f"""
+            你是一个专业的加密货币交易员。用户开始了一个投资模拟，初始资金为${session['initial_funds']}。
+            请根据当前市场情况提供初始投资策略，要求以JSON格式返回，包含以下字段：
+            1. leverage: 建议使用的杠杆倍数（根据市场波动性和风险控制需要，数值）
+            2. strategy: 投资策略描述（文本）
+            3. suggested_positions: 建议的仓位配置，包含币种和分配比例的数组
+            4. risk_control: 风险控制建议（文本）
+            5. adjustment_strategy: 仓位调整策略（文本）
+            
+            返回格式示例：
+            {{
+              "leverage": 10,
+              "strategy": "根据当前市场波动，建议采用中等杠杆策略",
+              "suggested_positions": [
+                {{"coin": "bitcoin", "percentage": 50}},
+                {{"coin": "ethereum", "percentage": 30}}
+              ],
+              "risk_control": "设置止损点为5%",
+              "adjustment_strategy": "当币价波动超过10%时调整仓位"
+            }}
+            
+            请严格按照上述JSON格式返回，不要包含其他内容，不要使用代码块标记（如```json）。
+            """
+            
+            logger.info("开始调用AI提供商的text_chat方法")
+            # 请求AI分析
+            llm_response = await provider.text_chat(
+                prompt=prompt,
+                system_prompt="你是一个专业的加密货币交易员和投资顾问，必须严格按照要求的JSON格式返回数据，不要使用代码块标记（如```json）"
+            )
+            logger.info("AI提供商调用完成")
+            
+            # 尝试解析AI返回的JSON数据
+            try:
+                # 处理可能包含在代码块中的JSON
+                completion_text = llm_response.completion_text.strip()
+                if completion_text.startswith("```"):
+                    # 提取代码块中的内容
+                    lines = completion_text.split('\n')
+                    json_lines = []
+                    in_json_block = False
+                    for line in lines:
+                        if line.startswith("```json"):
+                            in_json_block = True
+                            continue
+                        elif line.startswith("```") and in_json_block:
+                            break
+                        elif in_json_block:
+                            json_lines.append(line)
+                    completion_text = '\n'.join(json_lines)
+                
+                ai_data = json.loads(completion_text)
+                # 更新会话中的杠杆倍数
+                if "leverage" in ai_data:
+                    session["leverage"] = ai_data["leverage"]
+                
+                # 构造返回文本
+                result = f"建议杠杆: {ai_data.get('leverage', 'N/A')}x\n"
+                result += f"投资策略: {ai_data.get('strategy', 'N/A')}\n"
+                result += "建议仓位: \n"
+                for pos in ai_data.get('suggested_positions', []):
+                    result += f"  - {pos.get('coin', 'N/A')}: {pos.get('percentage', 0)}%\n"
+                result += f"风险控制: {ai_data.get('risk_control', 'N/A')}\n"
+                result += f"调整策略: {ai_data.get('adjustment_strategy', 'N/A')}\n"
+                
+                # 保存建议仓位到会话
+                session["suggested_positions"] = ai_data.get('suggested_positions', [])
+                
+                return result
+            except json.JSONDecodeError as e:
+                logger.error(f"解析AI返回的JSON数据失败: {e}")
+                # 如果解析失败，返回原始文本
+                return llm_response.completion_text
+        except Exception as e:
+            logger.error(f"获取AI策略分析失败: {e}")
+            return "无法获取AI策略分析"
+    
+    async def settle_investment(self, session, event: AstrMessageEvent):
+        """结算投资模拟"""
+        try:
+            # 这里可以添加更复杂的结算逻辑
+            profit_loss = session["current_funds"] - session["initial_funds"]
+            profit_loss_percent = (profit_loss / session["initial_funds"]) * 100
+            
+            result = f"📊 投资模拟结算\n"
+            result += f"起始资金: ${session['initial_funds']:,.2f}\n"
+            result += f"最终资金: ${session['current_funds']:,.2f}\n"
+            result += f"盈亏: ${profit_loss:,.2f} ({profit_loss_percent:+.2f}%)\n"
+            
+            # 使用AI提供商进行总结分析
+            ai_analysis = await self.get_ai_performance_analysis(event, session, profit_loss)
+            result += f"\n🤖 AI 性能分析:\n{ai_analysis}"
+            
+            return result
+        except Exception as e:
+            logger.error(f"结算投资失败: {e}")
+            return "结算失败"
+    
+    async def get_ai_performance_analysis(self, event: AstrMessageEvent, session, profit_loss) -> str:
+        """获取AI对投资表现的分析"""
+        try:
+            # 获取AI提供商
+            provider = None
+            # 如果配置了提供商列表，则按顺序尝试
+            if self.provider_list:
+                for provider_id in self.provider_list:
+                    provider = self.context.get_provider_by_id(provider_id=provider_id)
+                    if provider:
+                        break
+            # 如果没有配置提供商列表或列表中的提供商都不可用，则使用当前平台的提供商
+            if not provider:
+                provider = self.context.get_using_provider(umo=event.unified_msg_origin)
+            # 如果仍然没有获取到提供商，则使用第一个可用的提供商
+            if not provider:
+                providers = self.context.get_all_providers()
+                if providers:
+                    provider = providers[0]
+            
+            if not provider:
+                return "无法获取AI提供商，请检查配置"
+            
+            # 构建提示词
+            prompt = f"""
+            你是一个专业的投资分析师。用户完成了一个投资模拟，初始资金为${session['initial_funds']}，
+            最终资金为${session['current_funds']}，盈亏为${profit_loss}。
+            请分析这次投资的表现，包括成功或失败的原因，以及未来改进建议。
+            如果有资金变更记录，请结合这些记录进行分析。
+            
+            要求以JSON格式返回，包含以下字段：
+            1. performance_summary: 性能总结（文本）
+            2. profit_loss_analysis: 盈亏分析（文本）
+            3. risk_control_evaluation: 风控评估（文本）
+            4. improvement_suggestions: 改进建议（数组）
+            5. overall_rating: 总体评分（1-10的数值）
+            
+            返回格式示例：
+            {{
+              "performance_summary": "总体表现良好",
+              "profit_loss_analysis": "主要盈利来源于比特币的上涨",
+              "risk_control_evaluation": "风控措施执行得当",
+              "improvement_suggestions": [
+                "可以适当提高以太坊的仓位比例",
+                "建议在市场波动剧烈时降低杠杆"
+              ],
+              "overall_rating": 8
+            }}
+            
+            请严格按照上述JSON格式返回，不要包含其他内容，不要使用代码块标记（如```json）。
+            """
+            
+            # 请求AI分析
+            llm_response = await provider.text_chat(
+                prompt=prompt,
+                system_prompt="你是一个专业的投资分析师，必须严格按照要求的JSON格式返回数据，不要使用代码块标记（如```json）"
+            )
+            
+            # 尝试解析AI返回的JSON数据
+            try:
+                # 处理可能包含在代码块中的JSON
+                completion_text = llm_response.completion_text.strip()
+                if completion_text.startswith("```"):
+                    # 提取代码块中的内容
+                    lines = completion_text.split('\n')
+                    json_lines = []
+                    in_json_block = False
+                    for line in lines:
+                        if line.startswith("```json"):
+                            in_json_block = True
+                            continue
+                        elif line.startswith("```") and in_json_block:
+                            break
+                        elif in_json_block:
+                            json_lines.append(line)
+                    completion_text = '\n'.join(json_lines)
+                
+                ai_data = json.loads(completion_text)
+                
+                # 构造返回文本
+                result = f"总体评价: {ai_data.get('performance_summary', 'N/A')}\n"
+                result += f"盈亏分析: {ai_data.get('profit_loss_analysis', 'N/A')}\n"
+                result += f"风控评估: {ai_data.get('risk_control_evaluation', 'N/A')}\n"
+                result += "改进建议: \n"
+                for suggestion in ai_data.get('improvement_suggestions', []):
+                    result += f"  - {suggestion}\n"
+                result += f"总体评分: {ai_data.get('overall_rating', 'N/A')}/10\n"
+                
+                return result
+            except json.JSONDecodeError as e:
+                logger.error(f"解析AI返回的JSON数据失败: {e}")
+                # 如果解析失败，返回原始文本
+                return llm_response.completion_text
+        except Exception as e:
+            logger.error(f"获取AI性能分析失败: {e}")
+            return "无法获取AI性能分析"
+    
+    @command("cry_fight_adjust")
+    async def adjust_investment_funds(self, event: AstrMessageEvent, args_str: str = ""):
+        """调整投资模拟资金"""
+        try:
+            user_id = event.get_sender_id() if event.get_sender_id() else event.unified_msg_origin
+            if user_id not in self.investment_sessions:
+                yield event.plain_result("❌ 您没有正在进行的投资模拟")
+                return
+            
+            session = self.investment_sessions[user_id]
+            
+            try:
+                amount = float(args_str.strip())
+            except ValueError:
+                yield event.plain_result("❌ 请输入有效的资金数量，正数表示增加资金，负数表示减少资金")
+                return
+            
+            old_funds = session["current_funds"]
+            session["current_funds"] += amount
+            
+            # 记录资金变更
+            session["funds_history"].append({
+                "time": time.time(),
+                "old_funds": old_funds,
+                "amount": amount,
+                "new_funds": session["current_funds"]
+            })
+            
+            change_type = "增加" if amount > 0 else "减少"
+            result = f"📊 投资资金调整\n"
+            result += f"调整类型: {change_type}\n"
+            result += f"调整金额: ${abs(amount):,.2f}\n"
+            result += f"调整前资金: ${old_funds:,.2f}\n"
+            result += f"调整后资金: ${session['current_funds']:,.2f}"
+            
+            yield event.plain_result(result)
+        except Exception as e:
+            logger.error(f"调整投资资金失败: {e}")
+            yield event.plain_result("❌ 调整投资资金失败")
+    
+    @command("cry_fight_status")
+    async def investment_status(self, event: AstrMessageEvent):
+        """查看当前投资状态"""
+        try:
+            user_id = event.get_sender_id() if event.get_sender_id() else event.unified_msg_origin
+            if user_id not in self.investment_sessions:
+                yield event.plain_result("❌ 您没有正在进行的投资模拟")
+                return
+            
+            session = self.investment_sessions[user_id]
+            
+            # 计算盈亏
+            profit_loss = session["current_funds"] - session["initial_funds"]
+            profit_loss_percent = (profit_loss / session["initial_funds"]) * 100 if session["initial_funds"] != 0 else 0
+            
+            result = f"📊 投资模拟状态\n"
+            result += f"起始资金: ${session['initial_funds']:,.2f}\n"
+            result += f"当前资金: ${session['current_funds']:,.2f}\n"
+            result += f"盈亏: ${profit_loss:,.2f} ({profit_loss_percent:+.2f}%)\n"
+            result += f"当前杠杆: {session.get('leverage', 'N/A')}x\n"
+            
+            # 显示资金变更历史
+            if session["funds_history"]:
+                result += "\n资金变更历史:\n"
+                for i, record in enumerate(session["funds_history"][-5:], 1):  # 只显示最近5条记录
+                    change_type = "增加" if record['amount'] > 0 else "减少"
+                    result += f"{i}. {change_type} ${abs(record['amount']):,.2f} (余额: ${record['new_funds']:,.2f})\n"
+            
+            # 显示建议仓位
+            if session.get("suggested_positions"):
+                result += "\n建议仓位:\n"
+                for pos in session["suggested_positions"]:
+                    result += f"  - {pos.get('coin', 'N/A')}: {pos.get('percentage', 0)}%\n"
+            
+            yield event.plain_result(result)
+        except Exception as e:
+            logger.error(f"查看投资状态失败: {e}", exc_info=True)
+            yield event.plain_result("❌ 查看投资状态失败")
+    
     async def terminate(self):
         """可选择实现异步的插件销毁方法，当插件被卸载/停用时会调用。"""

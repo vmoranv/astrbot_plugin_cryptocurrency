@@ -1,0 +1,36 @@
+{
+  "target_currencies": {
+    "description": "目标加密货币列表",
+    "type": "list",
+    "items": {
+      "type": "string"
+    },
+    "hint": "需要监控的加密货币列表，使用 CoinGecko ID，例如 'bitcoin', 'ethereum' 等。",
+    "default": ["bitcoin", "ethereum"]
+  },
+  "cooldown_period": {
+    "description": "AI调整合约和杠杆倍数的冷却时间",
+    "type": "int",
+    "hint": "AI调整合约和杠杆倍数的最小间隔时间（秒）",
+    "default": 300,
+    "min": 60,
+    "max": 3600
+  },
+  "rate_query_cooldown": {
+    "description": "查询汇率的冷却时间",
+    "type": "int",
+    "hint": "查询加密货币汇率的最小间隔时间（秒），防止请求过于频繁",
+    "default": 2,
+    "min": 1,
+    "max": 60
+  },
+  "provider_list": {
+    "description": "AI提供商ID列表",
+    "type": "list",
+    "items": {
+      "type": "string"
+    },
+    "hint": "AI提供商ID列表，将按顺序尝试使用这些提供商。如果列表为空，则使用当前平台的AI提供商",
+    "default": []
+  }
+}
