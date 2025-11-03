@@ -20,7 +20,7 @@
     "description": "查询汇率的冷却时间",
     "type": "int",
     "hint": "查询加密货币汇率的最小间隔时间（秒），防止请求过于频繁",
-    "default": 2,
+    "default": 5,
     "min": 1,
     "max": 60
   },
