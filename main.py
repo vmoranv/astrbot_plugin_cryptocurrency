@@ -1157,7 +1157,23 @@ class MyPlugin(Star):
             如果决定不操作，"actions"数组中应只包含一个HOLD操作。
             """
             umo = session.get("user_umo")
-            llm_response = await provider.text_chat(prompt=prompt, system_prompt="你是一个专业的加密货币基金经理，必须严格按照要求的JSON格式返回决策。", umo=umo)
+            history = []
+            if umo:
+                try:
+                    conv_mgr = self.context.conversation_manager
+                    curr_cid = await conv_mgr.get_curr_conversation_id(umo)
+                    if curr_cid:
+                        conversation = await conv_mgr.get_conversation(umo, curr_cid)
+                        if conversation and conversation.history:
+                            history = json.loads(conversation.history)
+                except Exception as e:
+                    logger.warning(f"为 {umo} 获取对话历史失败: {e}")
+
+            llm_response = await provider.text_chat(
+                prompt=prompt,
+                system_prompt="你是一个专业的加密货币基金经理，必须严格按照要求的JSON格式返回决策。",
+                context=history
+            )
             return self.ai_parser.parse(llm_response.completion_text, REBALANCE_SCHEMA)
         except Exception as e:
             logger.error(f"获取AI调仓计划失败: {e}", exc_info=True)
