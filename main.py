@@ -11,13 +11,20 @@ import copy
 from .investment_utils import (calculate_futures_pnl,
                                calculate_liquidation_price, calculate_total_assets,
                                check_position_risk, calculate_total_margin_usage_ratio,
-                               calculate_coin_exposure)
+                               calculate_coin_exposure, calculate_minimum_margin)
 from .ai_parser import (AIResponseParser, STRATEGY_SCHEMA,
                         REBALANCE_SCHEMA, PERFORMANCE_SCHEMA)
 
 from pycoingecko import CoinGeckoAPI
 
-@register("cryptocurrency", "vmoranv", "加密货币价格查询插件", "1.0.0")
+class OperationResult:
+    """统一操作返回格式"""
+    def __init__(self, success: bool, message: str, data: dict = None):
+        self.success = success
+        self.message = message
+        self.data = data or {}
+
+@register("cryptocurrency", "vmoranv", "加密货币价格查询插件", "2.0.0")
 class MyPlugin(Star):
     def __init__(self, context: Context, config: dict | None = None):
         """初始化加密货币插件"""
@@ -25,6 +32,23 @@ class MyPlugin(Star):
         self.config = config if config is not None else {}
         self.cg = CoinGeckoAPI()
         self.ai_parser = AIResponseParser()
+        
+        # 定义操作的必需参数
+        self.ACTION_REQUIREMENTS = {
+            "BUY_SPOT": ["coin", "percentage_of_cash"],
+            "SELL_SPOT": ["coin", "percentage_of_holding"],
+            "OPEN_LONG": ["coin", "percentage_of_cash", "leverage"],
+            "OPEN_SHORT": ["coin", "percentage_of_cash", "leverage"],
+            "CLOSE_LONG": ["coin"],
+            "CLOSE_SHORT": ["coin"],
+            "ADD_MARGIN": ["coin", "percentage_of_cash"],
+            "REDUCE_MARGIN": ["coin", "percentage_of_margin"],
+            "INCREASE_LEVERAGE": ["coin", "new_leverage"],
+            "DECREASE_LEVERAGE": ["coin", "new_leverage"],
+            "SET_STOP_LOSS": ["coin", "stop_price"],
+            "SET_TAKE_PROFIT": ["coin", "target_price"],
+            "HOLD": [],
+        }
         
         # 设置默认配置
         self.target_currencies = self.config.get("target_currencies", ["bitcoin", "ethereum", "solana"])
@@ -551,6 +575,7 @@ class MyPlugin(Star):
                 "cooldown_period": self.cooldown_period,
                 "spot_positions": {},
                 "futures_positions": {},
+                "pending_orders": [], # 新增：用于存放止损等挂单
                 "margin_used": 0,
                 "cash": initial_funds,
                 "funds_history": [],
@@ -575,22 +600,59 @@ class MyPlugin(Star):
             yield event.plain_result("❌ 投资模拟启动失败")
 
     async def settle_investment(self, session, event: AstrMessageEvent):
-        """结算投资模拟"""
+        """结算投资模拟，包含平仓所有头寸和详细的盈亏分析"""
         try:
-            profit_loss = session["current_funds"] - session["initial_funds"]
-            profit_loss_percent = (profit_loss / session["initial_funds"]) * 100 if session["initial_funds"] != 0 else 0
+            logger.info(f"开始为用户 {session.get('user_id')} 结算投资...")
+            # 1. 获取所有持仓币种的最新价格
+            all_coin_ids = list(session.get("spot_positions", {}).keys()) + list(session.get("futures_positions", {}).keys())
+            prices_data = {}
+            if all_coin_ids:
+                prices_data = await asyncio.to_thread(self.cg.get_price, ids=list(set(all_coin_ids)), vs_currencies='usd')
+
+            # 2. 计算平仓后的最终现金
+            final_cash = session.get("cash", 0)
+            spot_pnl_total = 0
+            futures_pnl_total = 0
+
+            # 模拟平掉所有现货仓位
+            for coin_id, pos in session.get("spot_positions", {}).items():
+                price = prices_data.get(coin_id, {}).get('usd', pos.get('current_price', pos['entry_price']))
+                position_value = pos['amount'] * price
+                final_cash += position_value
+                spot_pnl_total += position_value - (pos['amount'] * pos['entry_price'])
+
+            # 模拟平掉所有合约仓位
+            for coin_id, pos in session.get("futures_positions", {}).items():
+                price = prices_data.get(coin_id, {}).get('usd', pos.get('current_price', pos['entry_price']))
+                pnl = calculate_futures_pnl(pos, price)
+                cash_returned = pos['margin'] + pnl
+                final_cash += cash_returned
+                futures_pnl_total += pnl
+
+            # 3. 计算最终财务数据
+            initial_funds = session["initial_funds"]
+            final_funds = final_cash
+            total_pnl = final_funds - initial_funds
+            total_pnl_percent = (total_pnl / initial_funds) * 100 if initial_funds != 0 else 0
+
+            # 4. 构建结算报告
+            result = (f"📊 **投资模拟结算**\n\n"
+                      f"**最终资产明细:**\n"
+                      f"  - 起始资金: ${initial_funds:,.2f}\n"
+                      f"  - 最终资金: ${final_funds:,.2f}\n"
+                      f"  - **总盈亏: ${total_pnl:,.2f} ({total_pnl_percent:+.2f}%)**\n\n"
+                      f"**盈亏来源分析:**\n"
+                      f"  - 现货交易盈亏: ${spot_pnl_total:,.2f}\n"
+                      f"  - 合约交易盈亏: ${futures_pnl_total:,.2f}\n")
             
-            result = (f"📊 投资模拟结算\n"
-                      f"起始资金: ${session['initial_funds']:,.2f}\n"
-                      f"最终资金: ${session['current_funds']:,.2f}\n"
-                      f"盈亏: ${profit_loss:,.2f} ({profit_loss_percent:+.2f}%)\n")
+            # 5. 获取AI性能分析
+            ai_analysis = await self.get_ai_performance_analysis(event, session, final_funds, total_pnl, total_pnl_percent)
+            result += f"\n🤖 **AI 性能分析**\n{ai_analysis}"
             
-            ai_analysis = await self.get_ai_performance_analysis(event, session)
-            result += f"\n{ai_analysis}"
             return result
         except Exception as e:
-            logger.error(f"结算投资失败: {e}")
-            return "结算失败"
+            logger.error(f"结算投资失败: {e}", exc_info=True)
+            return "❌ 结算失败，发生内部错误。"
 
     # --- AI Interaction & Logic ---
 
@@ -719,14 +781,12 @@ class MyPlugin(Star):
             logger.error(f"获取AI策略分析失败: {e}", exc_info=True)
             return "获取AI策略分析时发生错误"
 
-    async def get_ai_performance_analysis(self, event: AstrMessageEvent, session: dict) -> str:
+    async def get_ai_performance_analysis(self, event: AstrMessageEvent, session: dict, final_funds: float, profit_loss: float, profit_loss_percent: float) -> str:
         """获取AI对投资表现的分析 (使用解析器)"""
         try:
-            provider = await self._get_ai_provider(event=event)
+            provider = await self._get_ai_provider(event=event, session=session)
             if not provider: return "无法获取AI性能分析"
 
-            profit_loss = session["current_funds"] - session["initial_funds"]
-            profit_loss_percent = (profit_loss / session["initial_funds"]) * 100 if session["initial_funds"] != 0 else 0
             duration_days = (time.time() - session["start_time"]) / 86400
             position_history = "持仓历史记录暂未实现。"
 
@@ -735,7 +795,7 @@ class MyPlugin(Star):
 
             **基础信息：**
             - 初始资金：${session['initial_funds']:,.2f}
-            - 最终资金：${session['current_funds']:,.2f} 
+            - 最终资金：${final_funds:,.2f}
             - 盈亏：${profit_loss:,.2f} ({profit_loss_percent:+.2f}%)
             - 持续时间：{duration_days:.2f}天
             **持仓历史：** {position_history}
@@ -849,32 +909,35 @@ class MyPlugin(Star):
         user_ids = list(self.investment_sessions.keys())
         if not user_ids: return
 
+        all_coin_ids_set = set()
+        for user_id in user_ids:
+            session = self.investment_sessions.get(user_id)
+            if session:
+                all_coin_ids_set.update(session.get("spot_positions", {}).keys())
+                all_coin_ids_set.update(session.get("futures_positions", {}).keys())
+        
+        if not all_coin_ids_set: return
+        
+        try:
+            prices_data = await asyncio.to_thread(self.cg.get_price, ids=list(all_coin_ids_set), vs_currencies='usd')
+            if not prices_data:
+                logger.warning(f"无法为任何活跃会话获取价格数据。")
+                return
+        except Exception as e:
+            logger.error(f"批量获取价格失败: {e}", exc_info=True)
+            return
+
         for user_id in user_ids:
             session = self.investment_sessions.get(user_id)
             if not session: continue
-            
-            spot_positions = session.get("spot_positions", {})
-            futures_positions = session.get("futures_positions", {})
-            if not spot_positions and not futures_positions: continue
 
             try:
-                all_coin_ids = list(spot_positions.keys()) + list(futures_positions.keys())
-                if not all_coin_ids: continue
-
-                prices_data = await asyncio.to_thread(self.cg.get_price, ids=list(set(all_coin_ids)), vs_currencies='usd')
-                if not prices_data: continue
-
-                # 更新现货仓位
-                for coin_id, pos_data in spot_positions.items():
-                    current_price = prices_data.get(coin_id, {}).get('usd', pos_data['current_price'])
-                    pos_data['current_price'] = current_price
-                    pos_data['value'] = pos_data['amount'] * current_price
-                    pos_data['pnl'] = pos_data['value'] - (pos_data['amount'] * pos_data['entry_price'])
-
                 liquidated_coins = []
                 # 更新合约仓位
-                for coin_id, pos_data in futures_positions.items():
-                    current_price = prices_data.get(coin_id, {}).get('usd', pos_data['current_price'])
+                for coin_id, pos_data in session.get("futures_positions", {}).items():
+                    current_price = prices_data.get(coin_id, {}).get('usd')
+                    if current_price is None: continue # 如果没有获取到价格，则跳过此仓位更新
+
                     pos_data['current_price'] = current_price
                     should_liquidate, reason = check_position_risk(pos_data, current_price)
                     if should_liquidate:
@@ -887,6 +950,10 @@ class MyPlugin(Star):
                 for coin_id in liquidated_coins:
                     del session['futures_positions'][coin_id]
 
+                # 新增：检查并执行挂单（如止损）
+                await self._check_pending_orders(session, prices_data)
+ 
+                # 使用统一的函数计算总资产
                 session["current_funds"] = calculate_total_assets(session, prices_data)
 
                 if time.time() - session.get("last_ai_update_time", 0) > session.get("cooldown_period", 300):
@@ -954,6 +1021,67 @@ class MyPlugin(Star):
             logger.error(f"查看投资状态失败: {e}", exc_info=True)
             yield event.plain_result("❌ 查看投资状态失败")
     
+    async def _check_pending_orders(self, session: dict, prices_data: dict):
+        """检查并执行待处理订单，如止损单"""
+        triggered_orders_indices = []
+        user_id = session.get("user_id")
+
+        # 使用索引进行迭代以安全地删除
+        for i, order in enumerate(session.get("pending_orders", [])):
+            coin_id = order.get("coin")
+            if not coin_id: continue
+
+            current_price = prices_data.get(coin_id, {}).get('usd')
+            if not current_price: continue
+
+            pos = session['futures_positions'].get(coin_id)
+            if not pos:
+                triggered_orders_indices.append(i)
+                continue
+
+            order_type = order.get("type")
+            is_triggered = False
+            trigger_price = 0
+            reason_prefix = ""
+
+            if order_type == "STOP_LOSS":
+                stop_price = order["stop_price"]
+                if (pos['side'] == 'long' and current_price <= stop_price) or \
+                   (pos['side'] == 'short' and current_price >= stop_price):
+                    is_triggered = True
+                    trigger_price = stop_price
+                    reason_prefix = "止损"
+            
+            elif order_type == "TAKE_PROFIT":
+                target_price = order["target_price"]
+                if (pos['side'] == 'long' and current_price >= target_price) or \
+                   (pos['side'] == 'short' and current_price <= target_price):
+                    is_triggered = True
+                    trigger_price = target_price
+                    reason_prefix = "止盈"
+
+            if is_triggered:
+                logger.info(f"用户 {user_id} 的 {coin_id} {reason_prefix}单被触发！价格: {current_price}, 目标价: {trigger_price}")
+                
+                close_action = {
+                    "action": order["trigger_action"],
+                    "coin": coin_id,
+                    "reason": f"{reason_prefix}触发 at ${current_price:,.4f}"
+                }
+                
+                summary = await self._close_futures_position(session, close_action, pos['side'])
+                
+                if summary and (umo := session.get("user_umo")):
+                    icon = "🛡️" if order_type == "STOP_LOSS" else "🎯"
+                    message = f"{icon} **{reason_prefix}执行**\n{summary}"
+                    await self.context.send_message(message, umo=umo)
+
+                triggered_orders_indices.append(i)
+        
+        # 从后往前删除已触发的订单，避免索引错误
+        for i in sorted(triggered_orders_indices, reverse=True):
+            del session['pending_orders'][i]
+
     async def get_ai_rebalance_plan(self, user_id: str, session: dict) -> dict | None:
         """获取AI对当前投资组合的调仓计划 (使用新的Prompt和Schema)"""
         try:
@@ -983,17 +1111,29 @@ class MyPlugin(Star):
             **你的任务:** 根据当前市场状况和投资组合表现，决定最佳操作。
 
             **可用操作类型 (选择一种或多种):**
-            - `OPEN_LONG`: 开多头 `{{"action": "OPEN_LONG", "coin": "bitcoin", "percentage_of_cash": 8, "leverage": 5, "reason": "..."}}`
-            - `OPEN_SHORT`: 开空头 `{{"action": "OPEN_SHORT", "coin": "ethereum", "percentage_of_cash": 6, "leverage": 8, "reason": "..."}}`
-            - `CLOSE_LONG`: 平多头 `{{"action": "CLOSE_LONG", "coin": "solana", "reason": "..."}}`
-            - `CLOSE_SHORT`: 平空头 `{{"action": "CLOSE_SHORT", "coin": "bitcoin", "reason": "..."}}`
-            - `ADD_MARGIN`: 增加保证金 `{{"action": "ADD_MARGIN", "coin": "ethereum", "percentage_of_cash": 3, "reason": "..."}}`
-            - `REDUCE_MARGIN`: 减少保证金 `{{"action": "REDUCE_MARGIN", "coin": "bitcoin", "percentage_of_margin": 30, "reason": "..."}}`
-            - `INCREASE_LEVERAGE`: 提高杠杆 `{{"action": "INCREASE_LEVERAGE", "coin": "solana", "new_leverage": 10, "reason": "..."}}`
-            - `DECREASE_LEVERAGE`: 降低杠杆 `{{"action": "DECREASE_LEVERAGE", "coin": "ethereum", "new_leverage": 3, "reason": "..."}}`
-            - `BUY_SPOT`: 买入现货 `{{"action": "BUY_SPOT", "coin": "bitcoin", "percentage_of_cash": 15, "reason": "..."}}`
-            - `SELL_SPOT`: 卖出现货 `{{"action": "SELL_SPOT", "coin": "ethereum", "percentage_of_holding": 50, "reason": "..."}}`
-            - `HOLD`: 保持现状 `{{"action": "HOLD", "reason": "..."}}`
+
+            ## 🎯 核心交易操作:
+            - `BUY_SPOT`: 买入现货 `{{"action": "BUY_SPOT", "coin": "bitcoin", "percentage_of_cash": 15, "reason": "价值投资"}}`
+            - `SELL_SPOT`: 卖出现货 `{{"action": "SELL_SPOT", "coin": "ethereum", "percentage_of_holding": 50, "reason": "获利了结"}}`
+
+            ## 📈 合约方向操作:
+            - `OPEN_LONG`: 开多头 `{{"action": "OPEN_LONG", "coin": "solana", "percentage_of_cash": 8, "leverage": 5, "reason": "技术突破"}}`
+            - `OPEN_SHORT`: 开空头 `{{"action": "OPEN_SHORT", "coin": "bitcoin", "percentage_of_cash": 6, "leverage": 8, "reason": "阻力位受阻"}}`
+            - `CLOSE_LONG`: 平多头 `{{"action": "CLOSE_LONG", "coin": "ethereum", "reason": "达到目标位"}}`
+            - `CLOSE_SHORT`: 平空头 `{{"action": "CLOSE_SHORT", "coin": "solana", "reason": "支撑位反弹"}}`
+
+            ## ⚖️ 仓位管理操作:
+            - `ADD_MARGIN`: 增加保证金 `{{"action": "ADD_MARGIN", "coin": "bitcoin", "percentage_of_cash": 3, "reason": "降低强平风险"}}`
+            - `REDUCE_MARGIN`: 减少保证金 `{{"action": "REDUCE_MARGIN", "coin": "ethereum", "percentage_of_margin": 30, "reason": "提取浮动盈利"}}`
+            - `INCREASE_LEVERAGE`: 提高杠杆 `{{"action": "INCREASE_LEVERAGE", "coin": "solana", "new_leverage": 10, "reason": "趋势确认"}}`
+            - `DECREASE_LEVERAGE`: 降低杠杆 `{{"action": "DECREASE_LEVERAGE", "coin": "bitcoin", "new_leverage": 3, "reason": "风险控制"}}`
+
+            ## 🛡️ 风险管理操作:
+            - `SET_STOP_LOSS`: 设置止损 `{{"action": "SET_STOP_LOSS", "coin": "ethereum", "stop_price": 2500, "reason": "控制下行风险"}}`
+            - `SET_TAKE_PROFIT`: 设置止盈 `{{"action": "SET_TAKE_PROFIT", "coin": "ethereum", "target_price": 3500, "reason": "达到目标盈利位"}}`
+
+            ## 🎮 策略操作:
+            - `HOLD`: 保持现状 `{{"action": "HOLD", "reason": "市场趋势未变，当前仓位最优"}}`
 
             **投资规则:**
             - 可选币种: {currency_list_str}
@@ -1038,11 +1178,47 @@ class MyPlugin(Star):
             if umo := session.get("user_umo"):
                 await self.context.send_message(message, umo=umo)
 
-    async def _validate_operation_risk(self, session: dict, action: dict, temp_session_state: dict) -> str | None:
-        """
-        在执行操作前验证其是否会违反投资组合级别的风险规则。
-        返回错误信息字符串或 None (如果验证通过)。
-        """
+    async def _validate_action(self, session: dict, action: dict, temp_session_state: dict) -> OperationResult:
+        """对单个操作进行全面的参数和前提条件验证"""
+        
+        # 1. 参数完整性验证
+        param_errors = self._validate_action_parameters(action)
+        if param_errors:
+            return OperationResult(False, f"参数错误: {', '.join(param_errors)}")
+
+        # 2. 投资组合级别的风险验证
+        risk_error = self._validate_portfolio_risk(action, temp_session_state)
+        if risk_error:
+            return OperationResult(False, risk_error)
+
+        return OperationResult(True, "验证通过")
+
+    def _validate_action_parameters(self, action: dict) -> list[str]:
+        """验证操作参数的完整性、类型和范围"""
+        errors = []
+        action_type = action.get("action")
+        
+        # 检查必需参数
+        required_params = self.ACTION_REQUIREMENTS.get(action_type, [])
+        for param in required_params:
+            if param not in action:
+                errors.append(f"缺少必需参数: {param}")
+        if errors: return errors # 如果缺少参数，提前返回
+
+        # 检查通用数值参数的类型和范围
+        for param_name in ["percentage_of_cash", "percentage_of_holding", "percentage_of_margin"]:
+            if param_name in action:
+                val = action[param_name]
+                if not isinstance(val, (int, float)) or not (0 <= val <= 100):
+                    errors.append(f"参数 '{param_name}' 的值 ({val}) 必须是0-100之间的数字")
+
+        if "leverage" in action and not (isinstance(action["leverage"], (int, float)) and 1 <= action["leverage"] <= 100):
+            errors.append(f"杠杆倍数必须是1-100之间的数字")
+        
+        return errors
+
+    def _validate_portfolio_risk(self, action: dict, temp_session_state: dict) -> str | None:
+        """验证操作是否会违反投资组合级别的风险规则"""
         action_type = action.get("action")
         
         # 规则1: 总保证金使用率不得超过 25%
@@ -1066,53 +1242,46 @@ class MyPlugin(Star):
         return None # 验证通过
 
     async def execute_rebalance_plan(self, session: dict, plan: dict) -> list[str]:
-        """
-        以事务性方式执行AI返回的调仓计划。
-        - 'all-or-nothing': 任何一步失败都会回滚所有操作。
-        - 'pre-validation': 在执行每一步前进行风险验证。
-        """
+        """以事务性方式执行AI返回的调仓计划，并进行严格验证"""
         actions = plan.get("actions", [])
         summary = []
         
-        # 1. 创建会话状态的深度备份，用于失败时回滚
         session_backup = copy.deepcopy(session)
-        
+        temp_session_state = copy.deepcopy(session)
+
         try:
-            # 创建一个临时的会话状态副本，用于风险模拟
-            temp_session_state = copy.deepcopy(session)
-
             for action in actions:
-                # 2. 在执行前，使用临时状态进行风险验证
-                validation_error = await self._validate_operation_risk(session, action, temp_session_state)
-                if validation_error:
-                    # 如果验证失败，则抛出异常以触发回滚
-                    raise ValueError(f"操作 '{action.get('action')}'({action.get('coin')}) 验证失败: {validation_error}")
-
-                action_type = action.get("action")
-                handler = getattr(self, f"_handle_{action_type.lower()}", None)
+                action_type = action.get("action", "Unknown")
+                coin = action.get("coin", "N/A")
                 
-                if handler:
-                    # 3. 在真实的会话上执行操作
-                    result = await handler(session, action)
-                    if result:
-                        summary.append(result)
-                        # 操作成功后，同步更新临时状态以供下一步验证
-                        temp_session_state = copy.deepcopy(session)
-                else:
+                # 1. 综合验证
+                validation_result = await self._validate_action(session, action, temp_session_state)
+                if not validation_result.success:
+                    raise ValueError(f"操作 '{action_type}'({coin}) 验证失败: {validation_result.message}")
+
+                # 2. 查找并执行处理器
+                handler = getattr(self, f"_handle_{action_type.lower()}", None)
+                if not handler:
                     raise ValueError(f"未知的操作类型: {action_type}")
+                
+                # 3. 执行操作并处理结果
+                op_result: OperationResult = await handler(session, action)
+                if op_result.success:
+                    summary.append(op_result.message)
+                    # 操作成功后，同步更新临时状态以供下一步验证
+                    temp_session_state = copy.deepcopy(session)
+                else:
+                    # 如果单个处理器执行失败，则抛出异常以触发回滚
+                    raise ValueError(f"操作 '{action_type}'({coin}) 执行失败: {op_result.message}")
             
-            # 4. 所有操作成功，返回执行摘要
             return summary
             
         except Exception as e:
-            # 5. 捕获任何异常，执行回滚
             user_id = session.get("user_id")
+            logger.error(f"执行用户 {user_id} 的调仓计划失败，将回滚所有操作。错误: {e}", exc_info=True)
             if user_id and user_id in self.investment_sessions:
-                logger.error(f"执行用户 {user_id} 的调仓计划失败，将回滚所有操作。错误: {e}", exc_info=True)
-                self.investment_sessions[user_id] = session_backup # 恢复会话
-            else:
-                logger.error(f"执行调仓计划失败，但无法回滚因为缺少user_id或会话已不存在。错误: {e}", exc_info=True)
-
+                self.investment_sessions[user_id] = session_backup
+            
             return [f"❌ **操作失败并已回滚**", f"   原因: {e}"]
 
     async def _get_current_price(self, coin_id: str) -> float | None:
@@ -1126,16 +1295,15 @@ class MyPlugin(Star):
 
     # --- Action Handlers ---
 
-    async def _handle_buy_spot(self, session: dict, action: dict) -> str | None:
+    async def _handle_buy_spot(self, session: dict, action: dict) -> OperationResult:
         coin_id = action["coin"]
         price = await self._get_current_price(coin_id)
-        if not price: return f"❌ 买入 {coin_id} 失败：无法获取价格"
+        if not price: return OperationResult(False, f"无法获取 {coin_id} 的价格")
         
-        amount_to_invest = session['cash'] * (action.get('percentage_of_cash', 0) / 100)
-        if amount_to_invest <= 0: return None
-        # 验证资金
+        amount_to_invest = session['cash'] * (action['percentage_of_cash'] / 100)
+        if amount_to_invest <= 0: return OperationResult(True, "投资金额为0，无操作")
         if session['cash'] < amount_to_invest:
-            return f"❌ 买入 {coin_id} 失败：现金不足 (需要 ${amount_to_invest:,.2f}, 可用 ${session['cash']:.2f})"
+            return OperationResult(False, f"现金不足 (需要 ${amount_to_invest:,.2f}, 可用 ${session['cash']:.2f})")
 
         coin_amount = amount_to_invest / price
         session['cash'] -= amount_to_invest
@@ -1146,46 +1314,44 @@ class MyPlugin(Star):
         new_total_cost = (pos['amount'] * pos['entry_price']) + amount_to_invest
         pos['amount'] += coin_amount
         pos['entry_price'] = new_total_cost / pos['amount']
-        return f"✅ 使用 ${amount_to_invest:,.2f} 买入 {coin_id.upper()} 现货"
+        return OperationResult(True, f"✅ 使用 ${amount_to_invest:,.2f} 买入 {coin_id.upper()} 现货")
 
-    async def _handle_sell_spot(self, session: dict, action: dict) -> str | None:
+    async def _handle_sell_spot(self, session: dict, action: dict) -> OperationResult:
         coin_id = action["coin"]
-        if coin_id not in session['spot_positions']: return f"❌ 卖出 {coin_id} 失败：未持有该现货"
+        pos = session['spot_positions'].get(coin_id)
+        if not pos: return OperationResult(False, f"未持有 {coin_id} 现货")
         
-        price = await self._get_current_price(coin_id)
-        pos = session['spot_positions'][coin_id]
-        if not price: price = pos.get('current_price', pos['entry_price'])
-
-        percentage = action.get('percentage_of_holding', 0)
+        price = await self._get_current_price(coin_id) or pos.get('current_price', pos['entry_price'])
+        
+        percentage = action['percentage_of_holding']
         amount_to_sell = pos['amount'] * (percentage / 100)
-        if amount_to_sell <= 0: return None
+        if amount_to_sell <= 0: return OperationResult(True, "卖出数量为0，无操作")
         
         cash_gained = amount_to_sell * price
         session['cash'] += cash_gained
         pos['amount'] -= amount_to_sell
         
         if pos['amount'] < 1e-9: del session['spot_positions'][coin_id]
-        return f"✅ 卖出 {percentage}% 的 {coin_id.upper()} 现货，获得 ${cash_gained:,.2f}"
+        return OperationResult(True, f"✅ 卖出 {percentage}% 的 {coin_id.upper()} 现货，获得 ${cash_gained:,.2f}")
 
-    async def _handle_open_long(self, session: dict, action: dict) -> str | None:
+    async def _handle_open_long(self, session: dict, action: dict) -> OperationResult:
         return await self._open_futures_position(session, action, "long")
 
-    async def _handle_open_short(self, session: dict, action: dict) -> str | None:
+    async def _handle_open_short(self, session: dict, action: dict) -> OperationResult:
         return await self._open_futures_position(session, action, "short")
 
-    async def _open_futures_position(self, session: dict, action: dict, side: str) -> str | None:
+    async def _open_futures_position(self, session: dict, action: dict, side: str) -> OperationResult:
         coin_id = action["coin"]
         if (existing_pos := session['futures_positions'].get(coin_id)) and existing_pos['side'] != side:
-            return f"❌ 开仓 {coin_id} {side} 失败：已存在反向仓位"
+            return OperationResult(False, f"已存在 {coin_id} 的反向仓位")
         
         price = await self._get_current_price(coin_id)
-        if not price: return f"❌ 开仓 {coin_id} 失败：无法获取价格"
+        if not price: return OperationResult(False, f"无法获取 {coin_id} 的价格")
 
-        margin_to_use = session['cash'] * (action.get('percentage_of_cash', 0) / 100)
-        if margin_to_use <= 0: return None
-        # 验证资金
+        margin_to_use = session['cash'] * (action['percentage_of_cash'] / 100)
+        if margin_to_use <= 0: return OperationResult(True, "保证金为0，无操作")
         if session['cash'] < margin_to_use:
-            return f"❌ 开仓 {coin_id} 失败：现金不足 (需要 ${margin_to_use:,.2f}, 可用 ${session['cash']:.2f})"
+            return OperationResult(False, f"现金不足 (需要 ${margin_to_use:,.2f}, 可用 ${session['cash']:.2f})")
         
         leverage = action['leverage']
         session['cash'] -= margin_to_use
@@ -1193,43 +1359,38 @@ class MyPlugin(Star):
         
         position_value_to_add = margin_to_use * leverage
         coin_amount_to_add = position_value_to_add / price
-        
         side_str = "多单" if side == "long" else "空单"
 
         if existing_pos:
-            # 更新现有仓位
             new_total_value = existing_pos['value'] + position_value_to_add
             new_total_margin = existing_pos['margin'] + margin_to_use
             new_total_amount = existing_pos['amount'] + coin_amount_to_add
-            
-            existing_pos['entry_price'] = new_total_value / new_total_amount if new_total_amount > 0 else 0
-            existing_pos['margin'] = new_total_margin
-            existing_pos['amount'] = new_total_amount
-            existing_pos['value'] = new_total_value
-            existing_pos['leverage'] = new_total_value / new_total_margin if new_total_margin > 0 else 0
+            existing_pos.update({
+                'entry_price': new_total_value / new_total_amount if new_total_amount > 0 else 0,
+                'margin': new_total_margin, 'amount': new_total_amount, 'value': new_total_value,
+                'leverage': new_total_value / new_total_margin if new_total_margin > 0 else 0
+            })
             existing_pos['liquidation_price'] = calculate_liquidation_price(existing_pos['entry_price'], existing_pos['leverage'], side)
-            
-            return f"✅ 为 {coin_id.upper()} {side_str} 加仓 ${margin_to_use:,.2f} 保证金"
+            return OperationResult(True, f"✅ 为 {coin_id.upper()} {side_str} 加仓 ${margin_to_use:,.2f} 保证金")
         else:
-            # 创建新仓位
             liq_price = calculate_liquidation_price(price, leverage, side)
             session['futures_positions'][coin_id] = {
                 'amount': coin_amount_to_add, 'entry_price': price, 'current_price': price,
                 'value': position_value_to_add, 'margin': margin_to_use, 'leverage': leverage,
                 'side': side, 'liquidation_price': liq_price, 'pnl': 0
             }
-            return f"✅ 使用 ${margin_to_use:,.2f} 保证金开立 {coin_id.upper()} {leverage}x {side_str}"
+            return OperationResult(True, f"✅ 使用 ${margin_to_use:,.2f} 保证金开立 {coin_id.upper()} {leverage}x {side_str}")
 
-    async def _handle_close_long(self, session: dict, action: dict) -> str | None:
+    async def _handle_close_long(self, session: dict, action: dict) -> OperationResult:
         return await self._close_futures_position(session, action, "long")
 
-    async def _handle_close_short(self, session: dict, action: dict) -> str | None:
+    async def _handle_close_short(self, session: dict, action: dict) -> OperationResult:
         return await self._close_futures_position(session, action, "short")
 
-    async def _close_futures_position(self, session: dict, action: dict, side: str) -> str | None:
+    async def _close_futures_position(self, session: dict, action: dict, side: str) -> OperationResult:
         coin_id = action["coin"]
         pos = session['futures_positions'].get(coin_id)
-        if not pos or pos['side'] != side: return f"❌ 平仓 {coin_id} {side} 失败：无此仓位"
+        if not pos or pos['side'] != side: return OperationResult(False, f"无此 {coin_id} {side} 仓位")
         
         price = await self._get_current_price(coin_id) or pos['current_price']
         pnl = calculate_futures_pnl(pos, price)
@@ -1237,44 +1398,136 @@ class MyPlugin(Star):
         session['cash'] += cash_returned
         session['margin_used'] -= pos['margin']
         del session['futures_positions'][coin_id]
-        return f"✅ 平仓 {coin_id.upper()} {side} 合约，盈亏 ${pnl:,.2f}，总返还 ${cash_returned:,.2f}"
+        return OperationResult(True, f"✅ 平仓 {coin_id.upper()} {side} 合约，盈亏 ${pnl:,.2f}，总返还 ${cash_returned:,.2f}")
 
-    async def _handle_add_margin(self, session: dict, action: dict) -> str | None:
+    async def _handle_add_margin(self, session: dict, action: dict) -> OperationResult:
         coin_id = action["coin"]
         pos = session['futures_positions'].get(coin_id)
-        if not pos: return f"❌ 增加保证金失败: 未找到 {coin_id} 仓位"
+        if not pos: return OperationResult(False, f"未找到 {coin_id} 仓位")
 
-        amount_to_add = session['cash'] * (action.get('percentage_of_cash', 0) / 100)
-        if amount_to_add <= 0: return None
-        if session['cash'] < amount_to_add: return f"❌ 增加保证金失败: 现金不足"
+        amount_to_add = session['cash'] * (action['percentage_of_cash'] / 100)
+        if amount_to_add <= 0: return OperationResult(True, "增加保证金为0，无操作")
+        if session['cash'] < amount_to_add: return OperationResult(False, "现金不足")
 
         session['cash'] -= amount_to_add
         session['margin_used'] += amount_to_add
-        
-        # 更新仓位保证金
         pos['margin'] += amount_to_add
-        
-        # 仓位名义价值不变，因此有效杠杆降低
-        if pos['margin'] > 0:
-            pos['leverage'] = pos['value'] / pos['margin']
-        else: # 避免除零错误
-            pos['leverage'] = 0
-
-        # 重新计算强平价格
+        pos['leverage'] = pos['value'] / pos['margin'] if pos['margin'] > 0 else 0
         pos['liquidation_price'] = calculate_liquidation_price(pos['entry_price'], pos['leverage'], pos['side'])
-        return f"✅ 为 {coin_id.upper()} 仓位增加 ${amount_to_add:,.2f} 保证金, 新杠杆为 {pos['leverage']:.2f}x"
+        return OperationResult(True, f"✅ 为 {coin_id.upper()} 仓位增加 ${amount_to_add:,.2f} 保证金, 新杠杆为 {pos['leverage']:.2f}x")
 
-    async def _handle_reduce_margin(self, session: dict, action: dict) -> str | None:
-        # 逻辑较为复杂，暂不实现
-        return "⚠️ 减少保证金功能暂未实现"
+    async def _handle_reduce_margin(self, session: dict, action: dict) -> OperationResult:
+        coin_id = action["coin"]
+        pos = session['futures_positions'].get(coin_id)
+        if not pos: return OperationResult(False, f"未找到 {coin_id} 仓位")
 
-    async def _handle_increase_leverage(self, session: dict, action: dict) -> str | None:
-        # 逻辑较为复杂，暂不实现
-        return "⚠️ 调整杠杆功能暂未实现"
+        price = await self._get_current_price(coin_id) or pos['current_price']
+        pnl = calculate_futures_pnl(pos, price)
+        if pnl <= 0: return OperationResult(False, f"{coin_id} 仓位没有浮动盈利")
+
+        amount_to_reduce = pos['margin'] * (action['percentage_of_margin'] / 100)
+        if amount_to_reduce <= 0: return OperationResult(True, "减少保证金为0，无操作")
         
-    async def _handle_decrease_leverage(self, session: dict, action: dict) -> str | None:
-        # 逻辑较为复杂，暂不实现
-        return "⚠️ 调整杠杆功能暂未实现"
+        amount_to_reduce = min(amount_to_reduce, pnl)
+        new_margin = pos['margin'] - amount_to_reduce
+        min_required_margin = calculate_minimum_margin(pos['amount'] * price)
+        
+        if new_margin < min_required_margin:
+            return OperationResult(False, f"操作将导致保证金低于维持水平 (需要 {min_required_margin:,.2f})")
+
+        session['cash'] += amount_to_reduce
+        session['margin_used'] -= amount_to_reduce
+        pos['margin'] = new_margin
+        pos['leverage'] = pos['value'] / pos['margin'] if pos['margin'] > 0 else float('inf')
+        pos['liquidation_price'] = calculate_liquidation_price(pos['entry_price'], pos['leverage'], pos['side'])
+        return OperationResult(True, f"✅ 从 {coin_id.upper()} 仓位提取 ${amount_to_reduce:,.2f} 保证金, 新杠杆为 {pos['leverage']:.2f}x")
+
+    async def _handle_increase_leverage(self, session: dict, action: dict) -> OperationResult:
+        coin_id = action["coin"]
+        pos = session['futures_positions'].get(coin_id)
+        if not pos: return OperationResult(False, f"未找到 {coin_id} 仓位")
+
+        new_leverage = action['new_leverage']
+        if new_leverage <= pos['leverage']:
+            return OperationResult(False, f"新杠杆 ({new_leverage}x) 必须高于当前杠杆 ({pos['leverage']:.2f}x)")
+        if new_leverage > 100:
+            return OperationResult(False, f"新杠杆 ({new_leverage}x) 超过最大限制 (100x)")
+
+        price = await self._get_current_price(coin_id) or pos['current_price']
+        new_margin = (pos['amount'] * price) / new_leverage
+        margin_released = pos['margin'] - new_margin
+        
+        new_liquidation_price = calculate_liquidation_price(pos['entry_price'], new_leverage, pos['side'])
+        if (pos['side'] == 'long' and price <= new_liquidation_price) or \
+           (pos['side'] == 'short' and price >= new_liquidation_price):
+            return OperationResult(False, f"新杠杆将导致立即强平 (强平价: ${new_liquidation_price:,.4f})")
+
+        session['cash'] += margin_released
+        session['margin_used'] -= margin_released
+        pos.update({'margin': new_margin, 'leverage': new_leverage, 'liquidation_price': new_liquidation_price})
+        return OperationResult(True, f"✅ {coin_id.upper()} 仓位杠杆提高至 {new_leverage:.2f}x, 释放保证金 ${margin_released:,.2f}")
+        
+    async def _handle_decrease_leverage(self, session: dict, action: dict) -> OperationResult:
+        coin_id = action["coin"]
+        pos = session['futures_positions'].get(coin_id)
+        if not pos: return OperationResult(False, f"未找到 {coin_id} 仓位")
+
+        new_leverage = action['new_leverage']
+        if new_leverage >= pos['leverage']:
+            return OperationResult(False, f"新杠杆 ({new_leverage}x) 必须低于当前杠杆 ({pos['leverage']:.2f}x)")
+        if new_leverage < 1: return OperationResult(False, "杠杆不能低于1x")
+
+        price = await self._get_current_price(coin_id) or pos['current_price']
+        new_margin = (pos['amount'] * price) / new_leverage
+        margin_to_add = new_margin - pos['margin']
+
+        if session['cash'] < margin_to_add:
+            return OperationResult(False, f"现金不足 (需要 ${margin_to_add:,.2f}, 可用 ${session['cash']:.2f})")
+
+        session['cash'] -= margin_to_add
+        session['margin_used'] += margin_to_add
+        pos.update({'margin': new_margin, 'leverage': new_leverage})
+        pos['liquidation_price'] = calculate_liquidation_price(pos['entry_price'], new_leverage, pos['side'])
+        return OperationResult(True, f"✅ {coin_id.upper()} 仓位杠杆降低至 {new_leverage:.2f}x, 追加保证金 ${margin_to_add:,.2f}")
+
+    async def _handle_set_stop_loss(self, session: dict, action: dict) -> OperationResult:
+        return await self._create_conditional_order(session, action, "STOP_LOSS")
+
+    async def _handle_set_take_profit(self, session: dict, action: dict) -> OperationResult:
+        return await self._create_conditional_order(session, action, "TAKE_PROFIT")
+
+    async def _create_conditional_order(self, session: dict, action: dict, order_type: str) -> OperationResult:
+        """通用函数，用于创建止损或止盈订单"""
+        coin_id = action.get("coin")
+        price_key = "stop_price" if order_type == "STOP_LOSS" else "target_price"
+        price_val = action.get(price_key)
+        pos = session['futures_positions'].get(coin_id)
+        if not pos: return OperationResult(False, f"未找到 {coin_id} 的合约仓位")
+
+        current_price = pos.get('current_price', pos.get('entry_price'))
+        
+        # 验证价格的有效性
+        error_msg = ""
+        if order_type == "STOP_LOSS":
+            if pos['side'] == 'long' and price_val >= current_price: error_msg = f"止损价格 (${price_val}) 必须低于当前价 (${current_price})"
+            if pos['side'] == 'short' and price_val <= current_price: error_msg = f"止损价格 (${price_val}) 必须高于当前价 (${current_price})"
+        elif order_type == "TAKE_PROFIT":
+            if pos['side'] == 'long' and price_val <= current_price: error_msg = f"止盈价格 (${price_val}) 必须高于当前价 (${current_price})"
+            if pos['side'] == 'short' and price_val >= current_price: error_msg = f"止盈价格 (${price_val}) 必须低于当前价 (${current_price})"
+        if error_msg: return OperationResult(False, error_msg)
+
+        trigger_action = "CLOSE_LONG" if pos['side'] == 'long' else "CLOSE_SHORT"
+        
+        session['pending_orders'] = [o for o in session.get('pending_orders', []) if not (o.get('coin') == coin_id and o.get('type') == order_type)]
+
+        order = {
+            "type": order_type, "coin": coin_id, price_key: float(price_val),
+            "trigger_action": trigger_action, "reason": action.get("reason", f"AI设置{order_type}")
+        }
+        session['pending_orders'].append(order)
+        
+        order_type_str = "止损" if order_type == "STOP_LOSS" else "止盈"
+        return OperationResult(True, f"✅ 为 {coin_id.upper()} {pos['side']} 仓位设置{order_type_str}于 ${float(price_val):,.4f}")
 
     async def terminate(self):
         """可选择实现异步的插件销毁方法，当插件被卸载/停用时会调用。"""

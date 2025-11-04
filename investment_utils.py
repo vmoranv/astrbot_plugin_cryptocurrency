@@ -130,3 +130,13 @@ def calculate_coin_exposure(session: dict, coin_id: str, current_price: float) -
     if current_funds == 0: return 0
     
     return total_exposure / current_funds
+
+def calculate_minimum_margin(position_value: float, maintenance_margin_rate: float = 0.05) -> float:
+    """
+    计算维持仓位所需的最低保证金。
+
+    :param position_value: 仓位的当前名义价值 (amount * current_price)。
+    :param maintenance_margin_rate: 维持保证金率。
+    :return: 维持仓位所需的最低保证金金额。
+    """
+    return position_value * maintenance_margin_rate

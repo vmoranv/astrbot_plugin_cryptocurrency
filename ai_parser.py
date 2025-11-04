@@ -30,7 +30,10 @@ REBALANCE_SCHEMA = {
         "market_direction": {"type": str, "default": "neutral"},
         "confidence_level": {"type": str, "default": "medium"},
         "time_horizon": {"type": str, "default": "short_term"},
-        "actions": {"type": list, "default": []}
+        "actions": {
+            "type": list,
+            "default": [{"action": "HOLD", "reason": "默认保持仓位"}]
+        }
     }
 }
 
