@@ -1276,6 +1276,11 @@ class MyPlugin(Star):
                     raise ValueError(f"操作 '{action_type}'({coin}) 验证失败: {validation_result.message}")
 
                 # 2. 查找并执行处理器
+                # HOLD是一个特殊的无操作指令，直接跳过
+                if action_type == "HOLD":
+                    summary.append("✅ AI决定保持仓位不变")
+                    continue
+
                 handler = getattr(self, f"_handle_{action_type.lower()}", None)
                 if not handler:
                     raise ValueError(f"未知的操作类型: {action_type}")
