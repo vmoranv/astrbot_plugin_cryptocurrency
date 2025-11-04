@@ -10,8 +10,8 @@ import time
 import copy
 from .investment_utils import (calculate_futures_pnl,
                                calculate_liquidation_price, calculate_total_assets,
-                               check_position_risk, calculate_total_margin_usage_ratio,
-                               calculate_coin_exposure, calculate_minimum_margin)
+                               check_position_risk, calculate_maintenance_margin,
+                               calculate_total_margin_usage_ratio, calculate_coin_exposure)
 from .ai_parser import (AIResponseParser, STRATEGY_SCHEMA,
                         REBALANCE_SCHEMA, PERFORMANCE_SCHEMA)
 
@@ -112,7 +112,7 @@ class MyPlugin(Star):
             logger.error(f"查询交易对失败: {e}", exc_info=True)
             return None
 
-    @command("crypto")
+    @command("crypto", alias={"查币价"})
     async def query_crypto_price(self, event: AstrMessageEvent, symbol: str = ""):
         """查询加密货币对 USD 的实时汇率和市场数据，使用格式：/crypto <币种代号>"""
         try:
@@ -185,7 +185,7 @@ class MyPlugin(Star):
             logger.error(f"查询加密货币价格失败: {e}", exc_info=True)
             yield event.plain_result(f"❌ 查询失败：{str(e)}\n请稍后重试或检查网络连接")
 
-    @command("trending")
+    @command("trending", alias={"热门币种"})
     async def trending_coins(self, event: AstrMessageEvent):
         """获取 CoinGecko 上的热门币种"""
         try:
@@ -209,7 +209,7 @@ class MyPlugin(Star):
             logger.error(f"获取热门币种失败: {e}", exc_info=True)
             yield event.plain_result("❌ 获取热门币种失败")
 
-    @command("config_currencies")
+    @command("config_currencies", alias={"目标币种"})
     async def config_currencies(self, event: AstrMessageEvent):
         """显示当前配置的目标加密货币"""
         try:
@@ -226,7 +226,7 @@ class MyPlugin(Star):
             logger.error(f"获取配置货币失败: {e}")
             yield event.plain_result("❌ 获取配置货币失败")
     
-    @command("global")
+    @command("global", alias={"市场概览"})
     async def global_market_data(self, event: AstrMessageEvent):
         """获取全球加密货币市场数据"""
         try:
@@ -266,7 +266,7 @@ class MyPlugin(Star):
             logger.error(f"获取全球市场数据失败: {e}", exc_info=True)
             yield event.plain_result("❌ 获取全球市场数据失败")
 
-    @command("categories")
+    @command("categories", alias={"所有分类"})
     async def list_categories(self, event: AstrMessageEvent):
         """列出所有币种分类"""
         try:
@@ -293,7 +293,7 @@ class MyPlugin(Star):
             logger.error(f"获取分类列表失败: {e}", exc_info=True)
             yield event.plain_result("❌ 获取分类列表失败")
 
-    @command("category")
+    @command("category", alias={"分类查询"})
     async def coins_by_category(self, event: AstrMessageEvent, category_id: str = ""):
         """获取特定分类下的币种市场数据"""
         try:
@@ -318,7 +318,7 @@ class MyPlugin(Star):
             logger.error(f"获取分类数据失败: {e}", exc_info=True)
             yield event.plain_result(f"❌ 获取分类 '{category_id}' 数据失败")
 
-    @command("exchange")
+    @command("exchange", alias={"交易所信息"})
     async def exchange_info(self, event: AstrMessageEvent, exchange_id: str = ""):
         """获取交易所信息"""
         try:
@@ -345,7 +345,7 @@ class MyPlugin(Star):
             logger.error(f"获取交易所信息失败: {e}", exc_info=True)
             yield event.plain_result(f"❌ 获取交易所 '{exchange_id}' 信息失败")
 
-    @command("cry_tickers")
+    @command("cry_tickers", alias={"交易对"})
     async def get_tickers(self, event: AstrMessageEvent, args_str: str = ""):
         """获取币种的交易对信息。格式: /cry_tickers <币种>,[交易所ID]"""
         try:
@@ -395,7 +395,7 @@ class MyPlugin(Star):
             logger.error(f"获取交易对失败: {e}", exc_info=True)
             yield event.plain_result(f"❌ 获取 '{symbol}' 交易对失败")
 
-    @command("chart")
+    @command("chart", alias={"价格图"})
     async def get_sparkline_chart(self, event: AstrMessageEvent, symbol: str = ""):
         """获取币种7日价格走势图"""
         try:
@@ -432,7 +432,7 @@ class MyPlugin(Star):
             logger.error(f"生成图表失败: {e}", exc_info=True)
             yield event.plain_result("❌ 生成价格图表失败。")
 
-    @command("cry_history")
+    @command("cry_history", alias={"历史价格"})
     async def get_history(self, event: AstrMessageEvent, args_str: str = ""):
         """显示币种的历史价格摘要。格式: /cry_history <币种>,[天数]"""
         try:
@@ -491,7 +491,7 @@ class MyPlugin(Star):
             logger.error(f"获取历史数据失败: {e}", exc_info=True)
             yield event.plain_result("❌ 获取历史数据失败。")
 
-    @command("networks")
+    @command("networks", alias={"网络列表"})
     async def get_networks(self, event: AstrMessageEvent):
         """列出 CoinGecko 支持的所有区块链网络及其原生代币"""
         try:
@@ -512,7 +512,7 @@ class MyPlugin(Star):
             logger.error(f"获取网络列表失败: {e}", exc_info=True)
             yield event.plain_result("❌ 获取网络列表失败。")
 
-    @command("gainerslosers")
+    @command("gainerslosers", alias={"涨跌榜"})
     async def get_gainers_losers(self, event: AstrMessageEvent):
         """显示24小时内市场涨幅和跌幅最大的币种"""
         try:
@@ -542,7 +542,7 @@ class MyPlugin(Star):
 
     # --- Investment Simulation Core ---
 
-    @command("cry_fight")
+    @command("cry_fight", alias={"投资模拟"})
     async def investment_simulation(self, event: AstrMessageEvent, args_str: str = ""):
         """开始或管理投资模拟"""
         try:
@@ -943,6 +943,15 @@ class MyPlugin(Star):
                     should_liquidate, reason = check_position_risk(pos_data, current_price)
                     if should_liquidate:
                         logger.warning(f"用户 {user_id} 的 {coin_id} {pos_data['side']} 仓位已被强平！原因: {reason}")
+                        
+                        # 强制平仓时发送通知
+                        if umo := session.get("user_umo"):
+                            side_str = "多头" if pos_data['side'] == 'long' else "空头"
+                            message = (f"🚨 **强制平仓通知** 🚨\n"
+                                       f"您的 {coin_id.capitalize()} {side_str} 合约仓位已被强制平仓。\n"
+                                       f"原因: {reason}")
+                            asyncio.create_task(self.context.send_message(umo, message))
+
                         session['margin_used'] -= pos_data['margin']
                         liquidated_coins.append(coin_id)
                         continue
@@ -963,7 +972,7 @@ class MyPlugin(Star):
             except Exception as e:
                 logger.error(f"更新用户 {user_id} 的投资模拟会话失败: {e}", exc_info=True)
     
-    @command("cry_fight_status")
+    @command("cry_fight_status", alias={"持仓状态"})
     async def investment_status(self, event: AstrMessageEvent):
         """查看当前投资状态 (优化版，无网络请求)"""
         try:
@@ -1094,22 +1103,61 @@ class MyPlugin(Star):
             profit_loss = session['current_funds'] - session['initial_funds']
             profit_loss_percent = (profit_loss / session['initial_funds']) * 100 if session['initial_funds'] > 0 else 0
 
+            # New calculations for enhanced context
+            total_margin_usage_ratio = calculate_total_margin_usage_ratio(session)
+            
+            all_held_coins = set(session.get("spot_positions", {}).keys()) | set(session.get("futures_positions", {}).keys())
+            coin_exposures = {}
+            for coin_id in all_held_coins:
+                # The current_price should be available in the position data from the background update task
+                price = 0
+                if spot_pos := session.get("spot_positions", {}).get(coin_id):
+                    price = spot_pos.get('current_price', 0)
+                if not price:
+                    if futures_pos := session.get("futures_positions", {}).get(coin_id):
+                        price = futures_pos.get('current_price', 0)
+
+                if price and price > 0:
+                    exposure = calculate_coin_exposure(session, coin_id, price)
+                    coin_exposures[coin_id] = f"{exposure * 100:.2f}%"
+
             portfolio_summary = {
-                "total_funds": session['current_funds'], "initial_funds": session['initial_funds'],
-                "profit_loss_percent": profit_loss_percent, "cash": session['cash'],
-                "spot_positions": {c: {"value": p.get('value',0), "pnl": p.get('pnl',0), "current_price": p.get('current_price')} for c,p in session.get("spot_positions",{}).items()},
-                "futures_positions": {c: {"side": p.get('side'), "leverage": p.get('leverage'), "pnl": p.get('pnl',0), "current_price": p.get('current_price')} for c,p in session.get("futures_positions",{}).items()}
+                "total_funds": session['current_funds'],
+                "initial_funds": session['initial_funds'],
+                "profit_loss_percent": f"{profit_loss_percent:.2f}%",
+                "cash": session['cash'],
+                "margin_used": session.get("margin_used", 0),
+                "risk_metrics": {
+                    "total_margin_usage_ratio": f"{total_margin_usage_ratio * 100:.2f}%",
+                    "coin_exposures": coin_exposures
+                },
+                "spot_positions": {
+                    c: {"value": p.get('value', 0), "pnl": p.get('pnl', 0), "current_price": p.get('current_price')}
+                    for c, p in session.get("spot_positions", {}).items()
+                },
+                "futures_positions": {
+                    c: {
+                        "side": p.get('side'),
+                        "leverage": p.get('leverage'),
+                        "margin": p.get('margin'),
+                        "pnl": p.get('pnl', 0),
+                        "current_price": p.get('current_price')
+                    }
+                    for c, p in session.get("futures_positions", {}).items()
+                }
             }
             market_context = await self.get_market_context()
             currency_list_str = ", ".join(self.target_currencies)
 
             prompt = f"""
-            你是一个顶级的加密货币基金经理，负责管理一个动态的投资组合。
+            你是一个 **激进且果断的** 加密货币交易员，你的目标是利用市场波动和合约工具实现超额收益。
 
-            **当前投资组合状态:**
+            **当前投资组合状态 (包含关键风险指标):**
             {json.dumps(portfolio_summary, indent=2, ensure_ascii=False)}
 
-            **你的任务:** 根据当前市场状况和投资组合表现，决定最佳操作。
+            **你的任务:** 根据下方提供的 **当前投资组合状态 (JSON)** 制定一套**高风险高回报**的交易计划。忽略任何历史对话中可能存在的旧的持仓信息，只信任当前的JSON数据。
+            你的首要目标是**积极利用合约工具（开仓、平仓、调整杠杆）**，而不是长期持有现货。在遵守核心风险规则的前提下，大胆出击。
+            请特别关注 `risk_metrics` 中的 `total_margin_usage_ratio` (总保证金使用率) 和 `coin_exposures` (各币种风险敞口)，确保你的决策符合风险管理规则。
 
             **可用操作类型 (选择一种或多种):**
 
@@ -1172,10 +1220,22 @@ class MyPlugin(Star):
 
             llm_response = await provider.text_chat(
                 prompt=prompt,
-                system_prompt="你是一个专业的加密货币基金经理，必须严格按照要求的JSON格式返回决策。",
-                context=history
+                system_prompt="你是一个专业的加密货币基金经理，必须严格按照要求的JSON格式返回决策。"
             )
-            return self.ai_parser.parse(llm_response.completion_text, REBALANCE_SCHEMA)
+            logger.info(f"用户 {user_id} 的AI调仓计划原始响应: {llm_response.completion_text}")
+            
+            # 从Markdown代码块中提取纯JSON文本
+            raw_text = llm_response.completion_text
+            json_text = raw_text
+            if "```" in raw_text:
+                # 查找第一个 { 和最后一个 } 来提取JSON对象
+                json_start = raw_text.find('{')
+                json_end = raw_text.rfind('}')
+                if json_start != -1 and json_end != -1:
+                    json_text = raw_text[json_start:json_end+1]
+            
+            logger.info(f"用户 {user_id} 的AI调仓计划解析文本: {json_text}")
+            return self.ai_parser.parse(json_text, REBALANCE_SCHEMA)
         except Exception as e:
             logger.error(f"获取AI调仓计划失败: {e}", exc_info=True)
             return None
@@ -1264,34 +1324,36 @@ class MyPlugin(Star):
         summary = []
         
         session_backup = copy.deepcopy(session)
-        temp_session_state = copy.deepcopy(session)
-
+        
         try:
+            # 创建一个在整个计划执行期间持续更新的临时状态
+            temp_session_for_validation = copy.deepcopy(session)
+
             for action in actions:
                 action_type = action.get("action", "Unknown")
                 coin = action.get("coin", "N/A")
                 
-                # 1. 综合验证
-                validation_result = await self._validate_action(session, action, temp_session_state)
+                # 1. 使用最新的临时状态进行验证
+                validation_result = await self._validate_action(session, action, temp_session_for_validation)
                 if not validation_result.success:
                     raise ValueError(f"操作 '{action_type}'({coin}) 验证失败: {validation_result.message}")
 
-                # 2. 查找并执行处理器
-                # HOLD是一个特殊的无操作指令，直接跳过
+                # 2. HOLD是一个特殊的无操作指令，直接跳过
                 if action_type == "HOLD":
                     summary.append("✅ AI决定保持仓位不变")
                     continue
 
+                # 3. 查找处理器
                 handler = getattr(self, f"_handle_{action_type.lower()}", None)
                 if not handler:
                     raise ValueError(f"未知的操作类型: {action_type}")
                 
-                # 3. 执行操作并处理结果
+                # 4. 在真实的session上执行操作
                 op_result: OperationResult = await handler(session, action)
                 if op_result.success:
                     summary.append(op_result.message)
-                    # 操作成功后，同步更新临时状态以供下一步验证
-                    temp_session_state = copy.deepcopy(session)
+                    # 5. 操作成功后，立即更新临时状态以供下一步验证
+                    temp_session_for_validation = copy.deepcopy(session)
                 else:
                     # 如果单个处理器执行失败，则抛出异常以触发回滚
                     raise ValueError(f"操作 '{action_type}'({coin}) 执行失败: {op_result.message}")
@@ -1341,7 +1403,7 @@ class MyPlugin(Star):
     async def _handle_sell_spot(self, session: dict, action: dict) -> OperationResult:
         coin_id = action["coin"]
         pos = session['spot_positions'].get(coin_id)
-        if not pos: return OperationResult(False, f"未持有 {coin_id} 现货")
+        if not pos: return OperationResult(True, f"✅ 无需卖出，未持有 {coin_id} 现货。")
         
         price = await self._get_current_price(coin_id) or pos.get('current_price', pos['entry_price'])
         
@@ -1396,6 +1458,13 @@ class MyPlugin(Star):
             return OperationResult(True, f"✅ 为 {coin_id.upper()} {side_str} 加仓 ${margin_to_use:,.2f} 保证金")
         else:
             liq_price = calculate_liquidation_price(price, leverage, side)
+            
+            # 安全检查：防止开仓后立即被强平
+            safety_buffer = 0.1  # 10%的安全缓冲
+            if (side == 'long' and liq_price >= price * (1 - safety_buffer)) or \
+               (side == 'short' and liq_price <= price * (1 + safety_buffer)):
+                return OperationResult(False, f"强平价格 (${liq_price:,.2f}) 过于接近当前价格 (${price:,.2f})，风险过高")
+
             session['futures_positions'][coin_id] = {
                 'amount': coin_amount_to_add, 'entry_price': price, 'current_price': price,
                 'value': position_value_to_add, 'margin': margin_to_use, 'leverage': leverage,
@@ -1412,7 +1481,7 @@ class MyPlugin(Star):
     async def _close_futures_position(self, session: dict, action: dict, side: str) -> OperationResult:
         coin_id = action["coin"]
         pos = session['futures_positions'].get(coin_id)
-        if not pos or pos['side'] != side: return OperationResult(False, f"无此 {coin_id} {side} 仓位")
+        if not pos or pos['side'] != side: return OperationResult(True, f"✅ 无需平仓，无此 {coin_id} {side} 仓位。")
         
         price = await self._get_current_price(coin_id) or pos['current_price']
         pnl = calculate_futures_pnl(pos, price)
@@ -1454,7 +1523,7 @@ class MyPlugin(Star):
             return OperationResult(False, f"提取金额 (${amount_to_reduce:,.2f}) 超过当前浮动盈利 (${pnl:,.2f})")
 
         new_margin = pos['margin'] - amount_to_reduce
-        min_required_margin = calculate_minimum_margin(pos['amount'] * price)
+        min_required_margin = calculate_maintenance_margin(pos, price)
         
         if new_margin < min_required_margin:
             return OperationResult(False, f"操作将导致保证金低于维持水平 (需要 {min_required_margin:,.2f})")
@@ -1526,7 +1595,7 @@ class MyPlugin(Star):
         price_key = "stop_price" if order_type == "STOP_LOSS" else "target_price"
         price_val = action.get(price_key)
         pos = session['futures_positions'].get(coin_id)
-        if not pos: return OperationResult(False, f"未找到 {coin_id} 的合约仓位")
+        if not pos: return OperationResult(True, f"✅ 无需设置条件单，未找到 {coin_id} 的合约仓位。")
 
         current_price = pos.get('current_price', pos.get('entry_price'))
         

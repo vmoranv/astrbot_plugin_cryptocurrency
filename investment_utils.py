@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+from astrbot.api import logger
 
 def calculate_futures_pnl(position: dict, current_price: float) -> float:
     """
@@ -18,25 +19,33 @@ def calculate_futures_pnl(position: dict, current_price: float) -> float:
     pnl = price_diff * position['amount']
     return pnl
 
-def calculate_liquidation_price(entry_price: float, leverage: int, side: str, maintenance_margin_rate: float = 0.05) -> float:
+def get_maintenance_margin_rate(position_value: float, coin_id: str) -> float:
     """
-    计算考虑了维持保证金的强平价格。
+    模拟阶梯保证金制度
+    仓位越大，维持保证金率越高
+    """
+    if position_value <= 50000:
+        return 0.005  # 0.5%
+    elif position_value <= 200000:
+        return 0.008  # 0.8%
+    else:
+        return 0.012  # 1.2%
 
-    :param entry_price: 开仓价格。
-    :param leverage: 杠杆倍数。
-    :param side: 'long' 或 'short'。
-    :param maintenance_margin_rate: 维持保证金率 (例如 5% = 0.05)。
-    :return: 强平价格。
+def calculate_liquidation_price(entry_price: float, leverage: int, side: str,
+                              maintenance_margin_rate: float = 0.005,
+                              liquidation_fee_rate: float = 0.0005) -> float:
+    """
+    更精确的强平价格计算，考虑维持保证金率和强平手续费
     """
     if leverage == 0:
         return float('inf') if side == 'long' else 0
 
     if side == 'long':
-        # 多头强平价 = 开仓价 * (1 - (1 - 维持保证金率) / 杠杆)
-        return entry_price * (1 - (1 - maintenance_margin_rate) / leverage)
-    else:  # short
-        # 空头强平价 = 开仓价 * (1 + (1 - 维持保证金率) / 杠杆)
-        return entry_price * (1 + (1 - maintenance_margin_rate) / leverage)
+        # 多头：考虑强平手续费的影响
+        return entry_price * (1 - (1 - maintenance_margin_rate - liquidation_fee_rate) / leverage)
+    else:
+        # 空头：考虑强平手续费的影响
+        return entry_price * (1 + (1 - maintenance_margin_rate - liquidation_fee_rate) / leverage)
 
 def calculate_total_assets(session: dict, prices_data: dict) -> float:
     """
@@ -69,42 +78,39 @@ def calculate_total_assets(session: dict, prices_data: dict) -> float:
     total_assets = cash + spot_value + futures_equity
     return total_assets
 
-def calculate_margin_ratio(position: dict, current_price: float) -> float:
-    """计算当前保证金率"""
-    pnl = calculate_futures_pnl(position, current_price)
-    position_equity = position['margin'] + pnl
+def calculate_maintenance_margin(position: dict, current_price: float) -> float:
+    """计算维持保证金要求"""
     position_value = position['amount'] * current_price
+    maintenance_margin_rate = get_maintenance_margin_rate(position_value, position.get('coin', ''))
+    return position_value * maintenance_margin_rate
+
+def calculate_margin_ratio(position: dict, current_price: float) -> float:
+    """正确的保证金率计算"""
+    maintenance_margin_required = calculate_maintenance_margin(position, current_price)
     
-    if position_value == 0:
+    if maintenance_margin_required <= 0:
         return float('inf')
-        
-    return position_equity / position_value
+    
+    # 使用保证金余额（不含未实现盈亏）
+    return position['margin'] / maintenance_margin_required
 
 def check_position_risk(position: dict, current_price: float) -> tuple[bool, str]:
-    """
-    对单个仓位进行多维度风险检查。
-
-    :param position: 仓位信息。
-    :param current_price: 当前价格。
-    :return: (是否需要强平, 原因)
-    """
-    # 1. 价格强平检查 (最直接的指标)
-    if position['side'] == 'long' and current_price <= position['liquidation_price']:
-        return True, f"价格 ({current_price:.4f}) 触及强平线 ({position['liquidation_price']:.4f})"
-    if position['side'] == 'short' and current_price >= position['liquidation_price']:
-        return True, f"价格 ({current_price:.4f}) 触及强平线 ({position['liquidation_price']:.4f})"
-
-    # 2. 保证金率检查 (核心风险指标)
-    margin_ratio = calculate_margin_ratio(position, current_price)
-    # 维持保证金率通常是强平保证金率的2倍，这里用10%作为风险警戒线
-    if margin_ratio < 0.1:
-        return True, f"保证金率 ({margin_ratio:.2%}) 过低，有强平风险"
-
-    # 3. 最大亏损检查 (风控底线)
-    pnl = calculate_futures_pnl(position, current_price)
-    max_loss = position['margin'] * 0.8  # 允许的最大亏损为保证金的80%
-    if pnl < -max_loss:
-        return True, f"亏损 ({pnl:.2f}) 超过风险限额 ({-max_loss:.2f})"
+    """修复后的强平检测"""
+    # 使用标记价格进行风险检查
+    mark_price = current_price  # 实际应该使用 get_mark_price()
+    
+    margin_ratio = calculate_margin_ratio(position, mark_price)
+    
+    
+    # 强平条件：保证金率 <= 100%
+    if margin_ratio <= 1.0:
+        return True, f"保证金率 ({margin_ratio:.2%}) 达到强平阈值"
+    
+    # 价格强平检查
+    if position['side'] == 'long' and mark_price <= position['liquidation_price']:
+        return True, f"标记价格触及强平线"
+    if position['side'] == 'short' and mark_price >= position['liquidation_price']:
+        return True, f"标记价格触及强平线"
         
     return False, "风险可控"
 
@@ -130,13 +136,3 @@ def calculate_coin_exposure(session: dict, coin_id: str, current_price: float) -
     if current_funds == 0: return 0
     
     return total_exposure / current_funds
-
-def calculate_minimum_margin(position_value: float, maintenance_margin_rate: float = 0.05) -> float:
-    """
-    计算维持仓位所需的最低保证金。
-
-    :param position_value: 仓位的当前名义价值 (amount * current_price)。
-    :param maintenance_margin_rate: 维持保证金率。
-    :return: 维持仓位所需的最低保证金金额。
-    """
-    return position_value * maintenance_margin_rate
