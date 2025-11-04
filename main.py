@@ -1,5 +1,5 @@
 from astrbot.api.event import AstrMessageEvent
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star, StarTools
 from astrbot.api import logger
 import asyncio
 import astrbot.api.message_components as Comp
@@ -24,7 +24,6 @@ class OperationResult:
         self.message = message
         self.data = data or {}
 
-@register("cryptocurrency", "vmoranv", "加密货币价格查询插件", "2.0.0")
 class MyPlugin(Star):
     def __init__(self, context: Context, config: dict | None = None):
         """初始化加密货币插件"""
@@ -58,7 +57,9 @@ class MyPlugin(Star):
         
         # 投资模拟相关属性
         self.investment_sessions = {}
-        self.sessions_file = "investment_sessions.json"
+        data_dir = StarTools.get_data_dir("cryptocurrency")
+        data_dir.mkdir(parents=True, exist_ok=True)
+        self.sessions_file = data_dir / "investment_sessions.json"
         
         # 记录初始化信息
         logger.info(
@@ -1074,7 +1075,7 @@ class MyPlugin(Star):
                 if summary and (umo := session.get("user_umo")):
                     icon = "🛡️" if order_type == "STOP_LOSS" else "🎯"
                     message = f"{icon} **{reason_prefix}执行**\n{summary}"
-                    await self.context.send_message(message, umo=umo)
+                    await self.context.send_message(umo, message)
 
                 triggered_orders_indices.append(i)
         
@@ -1192,7 +1193,7 @@ class MyPlugin(Star):
         if execution_summary:
             message = f"🤖 **AI 投资组合调整已执行**\n\n**分析:** {analysis}\n\n**执行操作:**\n" + "\n".join(execution_summary)
             if umo := session.get("user_umo"):
-                await self.context.send_message(message, umo=umo)
+                await self.context.send_message(umo, message)
 
     async def _validate_action(self, session: dict, action: dict, temp_session_state: dict) -> OperationResult:
         """对单个操作进行全面的参数和前提条件验证"""
@@ -1449,7 +1450,9 @@ class MyPlugin(Star):
         amount_to_reduce = pos['margin'] * (action['percentage_of_margin'] / 100)
         if amount_to_reduce <= 0: return OperationResult(True, "减少保证金为0，无操作")
         
-        amount_to_reduce = min(amount_to_reduce, pnl)
+        if amount_to_reduce > pnl:
+            return OperationResult(False, f"提取金额 (${amount_to_reduce:,.2f}) 超过当前浮动盈利 (${pnl:,.2f})")
+
         new_margin = pos['margin'] - amount_to_reduce
         min_required_margin = calculate_minimum_margin(pos['amount'] * price)
         
@@ -1530,11 +1533,11 @@ class MyPlugin(Star):
         # 验证价格的有效性
         error_msg = ""
         if order_type == "STOP_LOSS":
-            if pos['side'] == 'long' and price_val >= current_price: error_msg = f"止损价格 (${price_val}) 必须低于当前价 (${current_price})"
-            if pos['side'] == 'short' and price_val <= current_price: error_msg = f"止损价格 (${price_val}) 必须高于当前价 (${current_price})"
+            if pos['side'] == 'long' and price_val >= current_price: error_msg = f"多头止损价格 (${price_val:,.2f}) 必须低于当前价 (${current_price:,.2f})"
+            if pos['side'] == 'short' and price_val <= current_price: error_msg = f"空头止损价格 (${price_val:,.2f}) 必须高于当前价 (${current_price:,.2f})"
         elif order_type == "TAKE_PROFIT":
-            if pos['side'] == 'long' and price_val <= current_price: error_msg = f"止盈价格 (${price_val}) 必须高于当前价 (${current_price})"
-            if pos['side'] == 'short' and price_val >= current_price: error_msg = f"止盈价格 (${price_val}) 必须低于当前价 (${current_price})"
+            if pos['side'] == 'long' and price_val <= current_price: error_msg = f"多头止盈价格 (${price_val:,.2f}) 必须高于当前价 (${current_price:,.2f})"
+            if pos['side'] == 'short' and price_val >= current_price: error_msg = f"空头止盈价格 (${price_val:,.2f}) 必须低于当前价 (${current_price:,.2f})"
         if error_msg: return OperationResult(False, error_msg)
 
         trigger_action = "CLOSE_LONG" if pos['side'] == 'long' else "CLOSE_SHORT"
