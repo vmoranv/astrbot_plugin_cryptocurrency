@@ -1096,8 +1096,8 @@ class MyPlugin(Star):
             portfolio_summary = {
                 "total_funds": session['current_funds'], "initial_funds": session['initial_funds'],
                 "profit_loss_percent": profit_loss_percent, "cash": session['cash'],
-                "spot_positions": {c: {"value": p.get('value',0), "pnl": p.get('pnl',0)} for c,p in session.get("spot_positions",{}).items()},
-                "futures_positions": {c: {"side": p.get('side'), "leverage": p.get('leverage'), "pnl": p.get('pnl',0)} for c,p in session.get("futures_positions",{}).items()}
+                "spot_positions": {c: {"value": p.get('value',0), "pnl": p.get('pnl',0), "current_price": p.get('current_price')} for c,p in session.get("spot_positions",{}).items()},
+                "futures_positions": {c: {"side": p.get('side'), "leverage": p.get('leverage'), "pnl": p.get('pnl',0), "current_price": p.get('current_price')} for c,p in session.get("futures_positions",{}).items()}
             }
             market_context = await self.get_market_context()
             currency_list_str = ", ".join(self.target_currencies)
