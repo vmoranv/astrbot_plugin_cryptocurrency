@@ -3,7 +3,8 @@
 def calculate_futures_pnl(position: dict, current_price: float) -> float:
     """
     计算单个合约仓位的未实现盈亏 (PnL).
-    根据用户的建议，这里的计算包含了杠杆。
+    重要：这里的 position['amount'] 是指合约代表的币的数量（名义价值 / 开仓价），
+    因此计算 PnL 时不应再乘以杠杆。
 
     :param position: 包含仓位信息的字典。
     :param current_price: 当前币种价格。
@@ -13,9 +14,8 @@ def calculate_futures_pnl(position: dict, current_price: float) -> float:
     if position['side'] == 'short':
         price_diff = -price_diff
     
-    # 根据用户反馈，盈亏计算需要乘以杠杆倍数
-    # PnL = (价格变动) * (数量) * (杠杆)
-    pnl = price_diff * position['amount'] * position['leverage']
+    # 正确的 PnL 计算: PnL = (价格变动) * (币的数量)
+    pnl = price_diff * position['amount']
     return pnl
 
 def calculate_liquidation_price(entry_price: float, leverage: int, side: str, maintenance_margin_rate: float = 0.05) -> float:
@@ -69,27 +69,64 @@ def calculate_total_assets(session: dict, prices_data: dict) -> float:
     total_assets = cash + spot_value + futures_equity
     return total_assets
 
+def calculate_margin_ratio(position: dict, current_price: float) -> float:
+    """计算当前保证金率"""
+    pnl = calculate_futures_pnl(position, current_price)
+    position_equity = position['margin'] + pnl
+    position_value = position['amount'] * current_price
+    
+    if position_value == 0:
+        return float('inf')
+        
+    return position_equity / position_value
+
 def check_position_risk(position: dict, current_price: float) -> tuple[bool, str]:
     """
-    检查单个仓位的风险，确定是否需要强平。
-    规则：当仓位净值低于初始保证金的20%时，触发强平。
+    对单个仓位进行多维度风险检查。
 
     :param position: 仓位信息。
     :param current_price: 当前价格。
     :return: (是否需要强平, 原因)
     """
-    # 检查价格触发的强平
+    # 1. 价格强平检查 (最直接的指标)
     if position['side'] == 'long' and current_price <= position['liquidation_price']:
-        return True, f"价格 ({current_price:.4f}) 触及或低于强平价格 ({position['liquidation_price']:.4f})"
+        return True, f"价格 ({current_price:.4f}) 触及强平线 ({position['liquidation_price']:.4f})"
     if position['side'] == 'short' and current_price >= position['liquidation_price']:
-        return True, f"价格 ({current_price:.4f}) 触及或高于强平价格 ({position['liquidation_price']:.4f})"
+        return True, f"价格 ({current_price:.4f}) 触及强平线 ({position['liquidation_price']:.4f})"
 
-    # 检查基于保证金的风险
+    # 2. 保证金率检查 (核心风险指标)
+    margin_ratio = calculate_margin_ratio(position, current_price)
+    # 维持保证金率通常是强平保证金率的2倍，这里用10%作为风险警戒线
+    if margin_ratio < 0.1:
+        return True, f"保证金率 ({margin_ratio:.2%}) 过低，有强平风险"
+
+    # 3. 最大亏损检查 (风控底线)
     pnl = calculate_futures_pnl(position, current_price)
-    position_equity = position['margin'] + pnl
-    
-    # 如果仓位净值低于初始保证金的20%，则标记为高风险并建议强平
-    if position_equity < position['margin'] * 0.2:
-        return True, f"仓位净值 ({position_equity:.2f}) 过低，低于初始保证金的20%"
+    max_loss = position['margin'] * 0.8  # 允许的最大亏损为保证金的80%
+    if pnl < -max_loss:
+        return True, f"亏损 ({pnl:.2f}) 超过风险限额 ({-max_loss:.2f})"
         
     return False, "风险可控"
+
+def calculate_total_margin_usage_ratio(session: dict) -> float:
+    """计算总保证金使用率"""
+    margin_used = session.get("margin_used", 0)
+    current_funds = session.get("current_funds", 1)
+    if current_funds == 0: return 0
+    return margin_used / current_funds
+
+def calculate_coin_exposure(session: dict, coin_id: str, current_price: float) -> float:
+    """计算单个币种的风险暴露度"""
+    spot_value = 0
+    if (spot_pos := session.get("spot_positions", {}).get(coin_id)):
+        spot_value = spot_pos['amount'] * current_price
+
+    futures_value = 0
+    if (futures_pos := session.get("futures_positions", {}).get(coin_id)):
+        futures_value = futures_pos['amount'] * current_price
+
+    total_exposure = spot_value + futures_value
+    current_funds = session.get("current_funds", 1)
+    if current_funds == 0: return 0
+    
+    return total_exposure / current_funds

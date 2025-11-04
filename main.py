@@ -7,9 +7,11 @@ from astrbot.api.all import command
 import json
 import time
 
+import copy
 from .investment_utils import (calculate_futures_pnl,
                                calculate_liquidation_price, calculate_total_assets,
-                               check_position_risk)
+                               check_position_risk, calculate_total_margin_usage_ratio,
+                               calculate_coin_exposure)
 from .ai_parser import (AIResponseParser, STRATEGY_SCHEMA,
                         REBALANCE_SCHEMA, PERFORMANCE_SCHEMA)
 
@@ -554,7 +556,8 @@ class MyPlugin(Star):
                 "funds_history": [],
                 "start_time": time.time(),
                 "last_ai_update_time": time.time(),
-                "user_umo": event.unified_msg_origin
+                "user_umo": event.unified_msg_origin,
+                "user_id": user_id
             }
             self.investment_sessions[user_id] = session
             
@@ -1035,19 +1038,82 @@ class MyPlugin(Star):
             if umo := session.get("user_umo"):
                 await self.context.send_message(message, umo=umo)
 
+    async def _validate_operation_risk(self, session: dict, action: dict, temp_session_state: dict) -> str | None:
+        """
+        在执行操作前验证其是否会违反投资组合级别的风险规则。
+        返回错误信息字符串或 None (如果验证通过)。
+        """
+        action_type = action.get("action")
+        
+        # 规则1: 总保证金使用率不得超过 25%
+        if action_type in ("OPEN_LONG", "OPEN_SHORT"):
+            margin_to_use = temp_session_state['cash'] * (action.get('percentage_of_cash', 0) / 100)
+            simulated_margin_used = temp_session_state.get("margin_used", 0) + margin_to_use
+            simulated_funds = temp_session_state.get("current_funds", 1)
+            
+            if simulated_funds > 0 and (simulated_margin_used / simulated_funds) > 0.25:
+                return f"风险过高: 开仓将导致总保证金使用率超过25%"
+
+        # 规则2: 必须保留至少 10% 的现金
+        if action_type in ("OPEN_LONG", "OPEN_SHORT", "BUY_SPOT", "ADD_MARGIN"):
+            cash_to_use = temp_session_state['cash'] * (action.get('percentage_of_cash', 0) / 100)
+            simulated_cash = temp_session_state.get("cash", 0) - cash_to_use
+            simulated_funds = temp_session_state.get("current_funds", 1)
+            
+            if simulated_funds > 0 and (simulated_cash / simulated_funds) < 0.10:
+                return f"现金不足: 操作将导致现金储备低于10%"
+
+        return None # 验证通过
+
     async def execute_rebalance_plan(self, session: dict, plan: dict) -> list[str]:
-        """执行AI返回的调仓计划"""
+        """
+        以事务性方式执行AI返回的调仓计划。
+        - 'all-or-nothing': 任何一步失败都会回滚所有操作。
+        - 'pre-validation': 在执行每一步前进行风险验证。
+        """
         actions = plan.get("actions", [])
         summary = []
-        for action in actions:
-            action_type = action.get("action")
-            handler = getattr(self, f"_handle_{action_type.lower()}", None)
-            if handler:
-                result = await handler(session, action)
-                if result: summary.append(result)
+        
+        # 1. 创建会话状态的深度备份，用于失败时回滚
+        session_backup = copy.deepcopy(session)
+        
+        try:
+            # 创建一个临时的会话状态副本，用于风险模拟
+            temp_session_state = copy.deepcopy(session)
+
+            for action in actions:
+                # 2. 在执行前，使用临时状态进行风险验证
+                validation_error = await self._validate_operation_risk(session, action, temp_session_state)
+                if validation_error:
+                    # 如果验证失败，则抛出异常以触发回滚
+                    raise ValueError(f"操作 '{action.get('action')}'({action.get('coin')}) 验证失败: {validation_error}")
+
+                action_type = action.get("action")
+                handler = getattr(self, f"_handle_{action_type.lower()}", None)
+                
+                if handler:
+                    # 3. 在真实的会话上执行操作
+                    result = await handler(session, action)
+                    if result:
+                        summary.append(result)
+                        # 操作成功后，同步更新临时状态以供下一步验证
+                        temp_session_state = copy.deepcopy(session)
+                else:
+                    raise ValueError(f"未知的操作类型: {action_type}")
+            
+            # 4. 所有操作成功，返回执行摘要
+            return summary
+            
+        except Exception as e:
+            # 5. 捕获任何异常，执行回滚
+            user_id = session.get("user_id")
+            if user_id and user_id in self.investment_sessions:
+                logger.error(f"执行用户 {user_id} 的调仓计划失败，将回滚所有操作。错误: {e}", exc_info=True)
+                self.investment_sessions[user_id] = session_backup # 恢复会话
             else:
-                logger.warning(f"未知的操作类型: {action_type}")
-        return summary
+                logger.error(f"执行调仓计划失败，但无法回滚因为缺少user_id或会话已不存在。错误: {e}", exc_info=True)
+
+            return [f"❌ **操作失败并已回滚**", f"   原因: {e}"]
 
     async def _get_current_price(self, coin_id: str) -> float | None:
         """获取单个币种的当前价格"""
@@ -1067,19 +1133,20 @@ class MyPlugin(Star):
         
         amount_to_invest = session['cash'] * (action.get('percentage_of_cash', 0) / 100)
         if amount_to_invest <= 0: return None
+        # 验证资金
+        if session['cash'] < amount_to_invest:
+            return f"❌ 买入 {coin_id} 失败：现金不足 (需要 ${amount_to_invest:,.2f}, 可用 ${session['cash']:.2f})"
 
-        if session['cash'] >= amount_to_invest:
-            coin_amount = amount_to_invest / price
-            session['cash'] -= amount_to_invest
-            
-            if coin_id not in session['spot_positions']:
-                session['spot_positions'][coin_id] = {'amount': 0, 'entry_price': price}
-            pos = session['spot_positions'][coin_id]
-            new_total_cost = (pos['amount'] * pos['entry_price']) + amount_to_invest
-            pos['amount'] += coin_amount
-            pos['entry_price'] = new_total_cost / pos['amount']
-            return f"✅ 使用 ${amount_to_invest:,.2f} 买入 {coin_id.upper()} 现货"
-        return f"❌ 买入 {coin_id} 失败：现金不足"
+        coin_amount = amount_to_invest / price
+        session['cash'] -= amount_to_invest
+        
+        if coin_id not in session['spot_positions']:
+            session['spot_positions'][coin_id] = {'amount': 0, 'entry_price': price}
+        pos = session['spot_positions'][coin_id]
+        new_total_cost = (pos['amount'] * pos['entry_price']) + amount_to_invest
+        pos['amount'] += coin_amount
+        pos['entry_price'] = new_total_cost / pos['amount']
+        return f"✅ 使用 ${amount_to_invest:,.2f} 买入 {coin_id.upper()} 现货"
 
     async def _handle_sell_spot(self, session: dict, action: dict) -> str | None:
         coin_id = action["coin"]
@@ -1116,7 +1183,9 @@ class MyPlugin(Star):
 
         margin_to_use = session['cash'] * (action.get('percentage_of_cash', 0) / 100)
         if margin_to_use <= 0: return None
-        if session['cash'] < margin_to_use: return f"❌ 开仓 {coin_id} 失败：现金不足"
+        # 验证资金
+        if session['cash'] < margin_to_use:
+            return f"❌ 开仓 {coin_id} 失败：现金不足 (需要 ${margin_to_use:,.2f}, 可用 ${session['cash']:.2f})"
         
         leverage = action['leverage']
         session['cash'] -= margin_to_use
