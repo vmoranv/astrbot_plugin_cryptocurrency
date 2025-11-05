@@ -569,6 +569,10 @@ class MyPlugin(Star):
                 yield event.plain_result("❌ 请输入有效的起始资金数量")
                 return
             
+            if user_id in self.investment_sessions:
+                yield event.plain_result("❌ 您已经有一个正在进行的投资模拟。请先使用 `/投资模拟 finish` 结束当前模拟。")
+                return
+            
             session = {
                 "initial_funds": initial_funds,
                 "current_funds": initial_funds,
